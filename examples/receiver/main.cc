@@ -85,20 +85,42 @@ class observer : public webrtc::PeerConnectionObserver,
       return;
     }
 
-    std::cout << "Received: " << message->get_payload() << "\n";
     auto payload = boost::json::parse(message->get_payload()).as_object();
-    auto offer = payload["offer"].as_object();
-    std::cout << "Offer: " << offer << "\n";
+    if (payload.contains("offer")) {
+      auto offer = payload["offer"].as_object();
 
-    peer_connection->SetRemoteDescription(
-        this, webrtc::CreateSessionDescription(
-                  webrtc::SdpTypeFromString(offer["type"].as_string().c_str())
-                      .value(),
-                  offer["sdp"].as_string().c_str())
-                  .release());
+      peer_connection->SetRemoteDescription(
+          this, webrtc::CreateSessionDescription(
+                    webrtc::SdpTypeFromString(offer["type"].as_string().c_str())
+                        .value(),
+                    offer["sdp"].as_string().c_str())
+                    .release());
 
-    peer_connection->CreateAnswer(
-        this, webrtc::PeerConnectionInterface::RTCOfferAnswerOptions{});
+      peer_connection->CreateAnswer(
+          this, webrtc::PeerConnectionInterface::RTCOfferAnswerOptions{});
+    } else if (payload.contains("new-ice-candidate")) {
+      auto blob = payload["new-ice-candidate"].as_object();
+      webrtc::SdpParseError error{};
+      std::unique_ptr<webrtc::IceCandidateInterface> candidate{
+          webrtc::CreateIceCandidate(blob["sdpMid"].as_string().c_str(),
+                                     blob["sdpMLineIndex"].as_int64(),
+                                     blob["candidate"].as_string().c_str(),
+                                     &error)};
+
+      if (!candidate) {
+        std::cerr << "Failed to parse ICE candidate: " << error.description
+                  << "\n";
+        return;
+      }
+
+      peer_connection->AddIceCandidate(
+          std::move(candidate), [](webrtc::RTCError error) {
+            if (!error.ok()) {
+              std::cout << "Failed to set ICE candidate with error: "
+                        << error.message() << "\n";
+            }
+          });
+    }
   }
 
   void on_open(websocketpp::connection_hdl hdl) {
@@ -113,9 +135,92 @@ class observer : public webrtc::PeerConnectionObserver,
       rtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) override {}
 
   void OnIceGatheringChange(
-      webrtc::PeerConnectionInterface::IceGatheringState new_state) override {}
+      webrtc::PeerConnectionInterface::IceGatheringState state) override {
+    std::cout << "ICE gathering state change: " << [state] {
+      switch (state) {
+        case decltype(state)::kIceGatheringComplete:
+          return "Complete";
+
+        case decltype(state)::kIceGatheringGathering:
+          return "Gathering";
+
+        case decltype(state)::kIceGatheringNew:
+          return "New";
+      }
+    }() << "\n";
+  }
+
+  void OnStandardizedIceConnectionChange(
+      webrtc::PeerConnectionInterface::IceConnectionState state) override {
+    std::cout << "ICE connection state change: " << [state] {
+      switch (state) {
+        case decltype(state)::kIceConnectionChecking:
+          return "Checking";
+
+        case decltype(state)::kIceConnectionClosed:
+          return "Closed";
+
+        case decltype(state)::kIceConnectionCompleted:
+          return "Completed";
+
+        case decltype(state)::kIceConnectionConnected:
+          return "Connected";
+
+        case decltype(state)::kIceConnectionDisconnected:
+          return "Disconnected";
+
+        case decltype(state)::kIceConnectionFailed:
+          return "Failed";
+
+        case decltype(state)::kIceConnectionMax:
+          return "Max";
+
+        case decltype(state)::kIceConnectionNew:
+          return "New";
+      }
+    }() << "\n";
+  }
 
   void OnIceCandidate(const webrtc::IceCandidateInterface* candidate) override {
+    std::string blob{};
+    if (!candidate->ToString(&blob)) {
+      std::cerr << "Failed to serialize ICE candidate\n";
+      return;
+    }
+
+    boost::json::object data{};
+    boost::json::object inner_blob{};
+    inner_blob["candidate"] = blob;
+    inner_blob["sdpMid"] = candidate->sdp_mid();
+    inner_blob["sdpMLineIndex"] = candidate->sdp_mline_index();
+    data["iceCandidate"] = inner_blob;
+    server.send(connection, boost::json::serialize(data),
+                websocketpp::frame::opcode::text);
+  }
+
+  void OnConnectionChange(
+      webrtc::PeerConnectionInterface::PeerConnectionState state) {
+    std::cout << "Connection state change: " << [state] {
+      switch (state) {
+        case decltype(state)::kNew:
+          return "New";
+
+        case decltype(state)::kFailed:
+          return "Failed";
+
+        case decltype(state)::kDisconnected:
+          return "Disconnected";
+
+        case decltype(state)::kConnecting:
+          return "Connecting";
+
+        case decltype(state)::kConnected:
+          return "Connected";
+
+        case decltype(state)::kClosed:
+          return "Closed";
+      }
+    }() << "\n";
   }
 
   void OnSuccess(webrtc::SessionDescriptionInterface* desc) override {
