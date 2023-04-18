@@ -43,9 +43,6 @@ class observer : public webrtc::PeerConnectionObserver,
 
     webrtc::PeerConnectionInterface::RTCConfiguration config{};
     config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
-    webrtc::PeerConnectionInterface::IceServer ice_server{};
-    ice_server.uri = "stun:localhost:3478";
-    config.servers.push_back(ice_server);
 
     const auto maybe_pc = pc_factory->CreatePeerConnectionOrError(
         config, webrtc::PeerConnectionDependencies{this});
@@ -245,6 +242,12 @@ class observer : public webrtc::PeerConnectionObserver,
 
   void OnFailure(webrtc::RTCError error) override {
     std::cerr << "Failed: " << error.message() << "\n";
+  }
+
+  void OnTrack(
+      rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
+    std::cout << "Added track of type: "
+              << cricket::MediaTypeToString(transceiver->media_type());
   }
 };
 

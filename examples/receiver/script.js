@@ -24,7 +24,7 @@ function callReceiver() {
 }
 
 async function makeCall() {
-    const configuration = {'iceServers': [{'urls': 'stun:stun.l.google.com:19302'}]}
+    const configuration = {}
     const peerConnection = new RTCPeerConnection(configuration);
     let stream = await navigator.mediaDevices.getUserMedia({video: true})
     stream.getTracks().forEach(track => { peerConnection.addTrack(track); });
@@ -35,9 +35,12 @@ async function makeCall() {
     };
 
     socket.onmessage = async message => {
+        message = JSON.parse(message.data)
+        console.log(message);
         if (message.answer) {
             const remoteDesc = new RTCSessionDescription(message.answer);
             await peerConnection.setRemoteDescription(remoteDesc);
+            console.log("set remote description")
         } else if (message.iceCandidate) {
             try {
                 await peerConnection.addIceCandidate(message.iceCandidate);
@@ -45,6 +48,8 @@ async function makeCall() {
             } catch (e) {
                 console.error('Error adding received ice candidate', e);
             }
+        } else {
+            console.warn(message);
         }
     };
 
