@@ -1,7 +1,7 @@
 let socket = null;
 
 function openSignallingChannel() {
-    let new_socket = new WebSocket("ws://localhost:9002");
+    let new_socket = new WebSocket("ws://18.236.77.108:9002");
     new_socket.onopen = () => {
         socket = new_socket;
         let button = document.getElementById("socketButton");
@@ -24,7 +24,14 @@ function callReceiver() {
 }
 
 async function makeCall() {
-    const configuration = {}
+    const configuration = {iceServers: [
+        {
+            urls: "turn:54.200.166.206:3478?transport=tcp",
+            username: "user",
+            credential: "root"
+        }
+    ]};
+    
     const peerConnection = new RTCPeerConnection(configuration);
     let stream = await navigator.mediaDevices.getUserMedia({video: true})
     stream.getTracks().forEach(track => { peerConnection.addTrack(track); });

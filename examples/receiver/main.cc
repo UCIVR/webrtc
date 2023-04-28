@@ -43,6 +43,11 @@ class observer : public webrtc::PeerConnectionObserver,
 
     webrtc::PeerConnectionInterface::RTCConfiguration config{};
     config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
+    webrtc::PeerConnectionInterface::IceServer turner {};
+    turner.uri = "turn:54.200.166.206:3478?transport=tcp";
+    turner.username = "user";
+    turner.password = "root";
+    config.servers.emplace_back(std::move(turner));
 
     const auto maybe_pc = pc_factory->CreatePeerConnectionOrError(
         config, webrtc::PeerConnectionDependencies{this});
