@@ -74,6 +74,7 @@ class observer : public webrtc::PeerConnectionObserver,
  private:
   server_type server{};
   rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection{};
+  rtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track{};
   websocketpp::connection_hdl connection{};
 
   void on_message(websocketpp::connection_hdl hdl, message_ptr message) {
@@ -252,7 +253,10 @@ class observer : public webrtc::PeerConnectionObserver,
   void OnTrack(
       rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
     std::cout << "Added track of type: "
-              << cricket::MediaTypeToString(transceiver->media_type());
+              << cricket::MediaTypeToString(transceiver->media_type()) << "\n";
+    track = transceiver->receiver()->track();
+    if (track->enabled())
+      std::cout << "Track is enabled\n";
   }
 };
 
