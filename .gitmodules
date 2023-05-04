@@ -1,3 +1,6 @@
 [submodule "examples/receiver/websocketpp"]
 	path = examples/receiver/websocketpp
 	url = git@github.com:zaphoyd/websocketpp.git
+[submodule "examples/libconductor/websocketpp"]
+	path = examples/libconductor/websocketpp
+	url = git@github.com:zaphoyd/websocketpp.git

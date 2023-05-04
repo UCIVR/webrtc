@@ -841,6 +841,26 @@ if (is_linux || is_chromeos || is_win) {
     include_dirs = [ "receiver/websocketpp", "C:/boost_1_82_0" ]
     lib_dirs = [ "C:/boost_1_82_0/lib64-msvc-14.3" ]
   }
+
+  rtc_shared_library("libconductor") {
+    testonly = true
+    sources = [ "libconductor/conductor.cc" ]
+    configs += [ "../build/config/compiler:exceptions" ]
+    deps = [
+      "../api:create_peerconnection_factory",
+      "../api:libjingle_peerconnection_api",
+      "../api:media_stream_interface",
+      "../api/video_codecs:video_codecs_api",
+      "../api/audio_codecs:audio_codecs_api",
+      "../api/video_codecs:builtin_video_decoder_factory",
+      "../api/video_codecs:builtin_video_encoder_factory",
+      "../api/audio_codecs:builtin_audio_decoder_factory",
+      "../api/audio_codecs:builtin_audio_encoder_factory",
+      "../rtc_base:threading"
+    ]
+    include_dirs = [ "libconductor/websocketpp", "C:/boost_1_82_0" ]
+    lib_dirs = [ "C:/boost_1_82_0/lib64-msvc-14.3" ]
+  }
 }
 
 if (is_win || is_android) {
