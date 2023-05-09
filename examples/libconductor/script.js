@@ -33,7 +33,13 @@ async function makeCall() {
     ]};
     
     const peerConnection = new RTCPeerConnection(configuration);
-    let stream = await navigator.mediaDevices.getUserMedia({video: true})
+    let stream = await navigator.mediaDevices.getDisplayMedia({
+        video: {
+            cursor: "always"
+        },
+        audio: false
+    });
+    
     stream.getTracks().forEach(track => { peerConnection.addTrack(track); });
     console.log("Added track");
 
