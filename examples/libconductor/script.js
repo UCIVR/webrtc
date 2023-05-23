@@ -1,7 +1,7 @@
 let socket = null;
 
 function openSignallingChannel() {
-    let new_socket = new WebSocket("ws://localhost:9002");
+    let new_socket = new WebSocket("ws://18.236.77.108:9003");
     new_socket.onopen = () => {
         socket = new_socket;
         let button = document.getElementById("socketButton");
@@ -68,7 +68,6 @@ async function makeCall() {
 
     const offer = await peerConnection.createOffer();
     await peerConnection.setLocalDescription(offer);
-    alert("created offer");
     socket.send(JSON.stringify({'offer': offer}));
 
     peerConnection.onicecandidate = event => {

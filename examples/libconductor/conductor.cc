@@ -20,8 +20,10 @@
 #include "api/video_codecs/builtin_video_encoder_factory.h"
 #include "websocketpp/config/asio_no_tls.hpp"
 #include "websocketpp/server.hpp"
+#include "websocketpp/client.hpp"
 
 using server_type = websocketpp::server<websocketpp::config::asio>;
+using client_type = websocketpp::client<websocketpp::config::asio>;
 using message_ptr = server_type::message_ptr;
 using websocketpp::lib::bind;
 using websocketpp::lib::placeholders::_1;
@@ -93,23 +95,32 @@ class observer : public webrtc::PeerConnectionObserver,
 
       peer_connection = std::move(maybe_pc.value());
 
-      server.init_asio();
-      server.set_message_handler(
-          websocketpp::lib::bind(&observer::on_message, this, ::_1, ::_2));
+      // server.init_asio();
+      // server.set_message_handler(
+      //     websocketpp::lib::bind(&observer::on_message, this, ::_1, ::_2));
 
-      server.set_open_handler(
-          websocketpp::lib::bind(&observer::on_open, this, ::_1));
+      // server.set_open_handler(
+      //     websocketpp::lib::bind(&observer::on_open, this, ::_1));
 
-      server.listen(9002);
-      server.start_accept();
-      log("Starting websocket server");
-      server.run();
-      log("Stopping websocket server");
+      // server.listen(9002);
+      // server.start_accept();
+      // log("Starting websocket server");
+      // server.run();
+      // log("Stopping websocket server");
+      
+      socket.init_asio();
+      socket.set_message_handler(websocketpp::lib::bind(&observer::on_message, this, ::_1, ::_2));
+      socket.set_open_handler(websocketpp::lib::bind(&observer::on_open, this, ::_1));
+      
+      websocketpp::lib::error_code ec;
+      const auto c = socket.get_connection("ws://18.236.77.108:9003", ec);
+      socket.connect(c);
+      socket.run();
     }};
   }
 
   ~observer() {
-    server.stop_listening();
+    //server.stop_listening();
     if (connection) {
       connection->close(websocketpp::close::status::normal, "Server exiting");
       log("Shutting down->");
@@ -130,7 +141,7 @@ class observer : public webrtc::PeerConnectionObserver,
   log_function* logger_impl{};
   on_video* on_video_impl{};
   std::thread server_thread{};
-  server_type server{};
+  client_type socket{};
   rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection{};
   rtc::scoped_refptr<webrtc::VideoTrackInterface> track{};
   server_type::connection_ptr connection{};
@@ -198,7 +209,7 @@ class observer : public webrtc::PeerConnectionObserver,
       log_error("Force-closed connection");
     }
 
-    connection = server.get_con_from_hdl(hdl);
+    connection = socket.get_con_from_hdl(hdl);
   }
 
   void OnSignalingChange(
@@ -273,7 +284,7 @@ class observer : public webrtc::PeerConnectionObserver,
     inner_blob["sdpMid"] = candidate->sdp_mid();
     inner_blob["sdpMLineIndex"] = candidate->sdp_mline_index();
     data["iceCandidate"] = inner_blob;
-    server.send(connection, boost::json::serialize(data),
+    socket.send(connection, boost::json::serialize(data),
                 websocketpp::frame::opcode::text);
   }
 
@@ -320,7 +331,7 @@ class observer : public webrtc::PeerConnectionObserver,
     data["sdp"] = sdp;
     boost::json::object msg{};
     msg["answer"] = data;
-    server.send(connection, boost::json::serialize(msg),
+    socket.send(connection, boost::json::serialize(msg),
                 websocketpp::frame::opcode::text);
   }
 
