@@ -4,9 +4,16 @@ function openSignallingChannel() {
     let new_socket = new WebSocket("ws://18.236.77.108:9003");
     new_socket.onopen = () => {
         socket = new_socket;
-        let button = document.getElementById("socketButton");
+        let button = document.getElementById("callButton");
         button.textContent = "Connected!";
         button.disabled = true;
+
+        if (!socket) {
+            alert("No signalling socket");
+            return;
+        }
+    
+        makeCall();
     };
 
     new_socket.onerror = (_, event) => {
@@ -15,12 +22,7 @@ function openSignallingChannel() {
 }
 
 function callReceiver() {
-    if (!socket) {
-        alert("No signalling socket");
-        return;
-    }
-
-    makeCall();
+    openSignallingChannel();
 }
 
 async function makeCall() {
