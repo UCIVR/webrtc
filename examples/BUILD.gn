@@ -838,7 +838,8 @@ if (is_linux || is_chromeos || is_win) {
       "../api/audio_codecs:builtin_audio_encoder_factory",
       "../rtc_base:threading"
     ]
-    include_dirs = [ "receiver/websocketpp", "C:/boost_1_82_0" ]
+
+    include_dirs = [ "receiver/websocketpp", "C:/boost_1_82_0", "../../../boost_1_82_0" ]
     lib_dirs = [ "C:/boost_1_82_0/lib64-msvc-14.3" ]
   }
 

@@ -22,10 +22,25 @@ using websocketpp::lib::placeholders::_1;
 using websocketpp::lib::placeholders::_2;
 
 namespace receiver {
+template <typename consumer_type>
 class observer : public webrtc::PeerConnectionObserver,
                  public webrtc::SetSessionDescriptionObserver,
                  public webrtc::CreateSessionDescriptionObserver {
  public:
+  observer(consumer_type& consumer, std::mutex& exit_lock)
+      : server{},
+        peer_connection{},
+        track{},
+        connection{},
+        waiter_thread{[&exit_lock, this] {
+          exit_lock.lock();
+          server.stop_listening();
+          close();
+          server.stop();
+          exit_lock.unlock();
+        }},
+        consumer{consumer} {}
+
   void start_signal_server() {
     const auto signaling_thread = rtc::Thread::CreateWithSocketServer();
     signaling_thread->Start();
@@ -43,7 +58,7 @@ class observer : public webrtc::PeerConnectionObserver,
 
     webrtc::PeerConnectionInterface::RTCConfiguration config{};
     config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
-    webrtc::PeerConnectionInterface::IceServer turner {};
+    webrtc::PeerConnectionInterface::IceServer turner{};
     turner.uri = "turn:54.200.166.206:3478?transport=tcp";
     turner.username = "user";
     turner.password = "root";
@@ -69,6 +84,7 @@ class observer : public webrtc::PeerConnectionObserver,
     server.listen(9002);
     server.start_accept();
     server.run();
+    stop();
   }
 
  private:
@@ -76,6 +92,24 @@ class observer : public webrtc::PeerConnectionObserver,
   rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection{};
   rtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track{};
   websocketpp::connection_hdl connection{};
+  std::thread waiter_thread{};
+  consumer_type& consumer{};
+
+  void stop() {
+    track = nullptr;
+    peer_connection->Close();
+    peer_connection = nullptr;
+    waiter_thread.join();
+  }
+
+  void close() {
+    if (!connection.expired()) {
+      server.close(connection, websocketpp::close::status::going_away,
+                   "Exited from console");
+
+      connection = {};
+    }
+  }
 
   void on_message(websocketpp::connection_hdl hdl, message_ptr message) {
     if (hdl.lock() != connection.lock()) {
@@ -127,8 +161,14 @@ class observer : public webrtc::PeerConnectionObserver,
   }
 
   void on_open(websocketpp::connection_hdl hdl) {
-    std::cout << "Connection opened\n";
-    connection = server.get_con_from_hdl(hdl);
+    if (connection.expired()) {
+      std::cout << "Connection opened\n";
+      connection = server.get_con_from_hdl(hdl);
+    } else {
+      std::cout << "Rejecting connection\n";
+      server.close(hdl, websocketpp::close::status::subprotocol_error,
+                   "Rejected connection; other client already present");
+    }
   }
 
   void OnSignalingChange(
@@ -155,12 +195,13 @@ class observer : public webrtc::PeerConnectionObserver,
 
   void OnStandardizedIceConnectionChange(
       webrtc::PeerConnectionInterface::IceConnectionState state) override {
-    std::cout << "ICE connection state change: " << [state] {
+    std::cout << "ICE connection state change: " << [this, state] {
       switch (state) {
         case decltype(state)::kIceConnectionChecking:
           return "Checking";
 
         case decltype(state)::kIceConnectionClosed:
+          close();
           return "Closed";
 
         case decltype(state)::kIceConnectionCompleted:
@@ -170,9 +211,11 @@ class observer : public webrtc::PeerConnectionObserver,
           return "Connected";
 
         case decltype(state)::kIceConnectionDisconnected:
+          close();
           return "Disconnected";
 
         case decltype(state)::kIceConnectionFailed:
+          close();
           return "Failed";
 
         case decltype(state)::kIceConnectionMax:
@@ -250,24 +293,57 @@ class observer : public webrtc::PeerConnectionObserver,
     std::cerr << "Failed: " << error.message() << "\n";
   }
 
-  void OnTrack(
-      rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
+  void OnTrack(rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver)
+      override {
     std::cout << "Added track of type: "
               << cricket::MediaTypeToString(transceiver->media_type()) << "\n";
     track = transceiver->receiver()->track();
     if (track->enabled())
       std::cout << "Track is enabled\n";
+
+    consumer.on_track(transceiver);
+  }
+};
+
+struct null_consumer {
+  void on_track(
+      rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
+    std::cout << "Null consumer saw new track\n";
   }
 };
 
 }  // namespace receiver
 
 int main() {
-  const auto observer = rtc::make_ref_counted<receiver::observer>();
+  using namespace receiver;
+
+  null_consumer consumer{};
+  std::mutex exit_lock{};
+
+  std::atomic_bool force_exit{};
+  std::thread input_thread{[&exit_lock, &force_exit] {
+    exit_lock.lock();
+    std::string input{};
+    while (input != "exit" && !std::cin.eof() && !force_exit)
+      std::cin >> input;
+    exit_lock.unlock();
+  }};
+
+  // Janky, but the idea is to wait for the lock to be held by input_thread;
+  while (exit_lock.try_lock())
+    exit_lock.unlock();
+
+  const auto presenter_stream =
+      rtc::make_ref_counted<observer<null_consumer>>(consumer, exit_lock);
+
   try {
-    observer->start_signal_server();
+    presenter_stream->start_signal_server();
   } catch (const websocketpp::exception& error) {
     std::cerr << error.what() << "\n";
-    return -1;
+    force_exit = true;
   }
+
+  input_thread.join();
+
+  return force_exit ? -1 : 0;
 }
