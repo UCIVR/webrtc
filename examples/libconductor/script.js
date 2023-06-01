@@ -1,7 +1,7 @@
 let socket = null;
 
 function openSignallingChannel() {
-    let new_socket = new WebSocket("ws://18.236.77.108:9003");
+    let new_socket = new WebSocket("ws://18.236.77.108:9002");
     new_socket.onopen = () => {
         socket = new_socket;
         let button = document.getElementById("callButton");
