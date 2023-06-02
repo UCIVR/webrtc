@@ -4,10 +4,7 @@ function openSignallingChannel() {
     let new_socket = new WebSocket("ws://18.236.77.108:9002");
     new_socket.onopen = () => {
         socket = new_socket;
-        let button = document.getElementById("callButton");
-        button.textContent = "Connected!";
-        button.disabled = true;
-
+        disable();
         if (!socket) {
             alert("No signalling socket");
             return;
@@ -19,6 +16,18 @@ function openSignallingChannel() {
     new_socket.onerror = (_, event) => {
         alert("Couldn't connect");
     }
+}
+
+function disable() {
+    let button = document.getElementById("callButton");
+    button.textContent = "Connected!";
+    button.disabled = true;
+}
+
+function enable() {
+    let button = document.getElementById("callButton");
+    button.textContent = "Share Screen";
+    button.disabled = false;
 }
 
 function callReceiver() {
@@ -47,6 +56,13 @@ async function makeCall() {
 
     peerConnection.onconnectionstatechange = event => {
         console.log(peerConnection.connectionState);
+        if (peerConnection.connectionState == "disconnected") {
+            socket.close();
+            socket = null;
+            enable();
+            peerConnection.close();
+            stream.getTracks().forEach(track => { track.stop(); });
+        }
     };
 
     socket.onmessage = async message => {
