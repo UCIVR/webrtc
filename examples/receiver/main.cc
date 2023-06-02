@@ -30,68 +30,17 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
                         public webrtc::SetSessionDescriptionObserver,
                         public webrtc::CreateSessionDescriptionObserver {
  public:
-  webrtc_observer(consumer_type& consumer, std::mutex& exit_lock)
-      : server{},
-        peer_connection{},
+  webrtc_observer(consumer_type& consumer)
+      : peer_connection{},
+        pc_factory{},
+        signaling_thread{},
         track{},
-        connection{},
-        waiter_thread{[&exit_lock, this] {
-          exit_lock.lock();
-          server.stop_listening();
-          close();
-          server.stop();
-          exit_lock.unlock();
-        }},
-        consumer{consumer} {}
-
-  void start_signal_server() {
+        consumer{consumer},
+        connection{} {
     init_webrtc();
-
-    server.init_asio();
-    server.set_message_handler(
-        websocketpp::lib::bind(&webrtc_observer::on_message, this, ::_1, ::_2));
-
-    server.set_open_handler(
-        websocketpp::lib::bind(&webrtc_observer::on_open, this, ::_1));
-
-    server.listen(9002);
-    server.start_accept();
-    server.run();
-    stop();
   }
 
- private:
-  server_type server{};
-  std::unique_ptr<rtc::Thread> signaling_thread{};
-  rtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> pc_factory{};
-  rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection{};
-  rtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track{};
-  websocketpp::connection_hdl connection{};
-  std::thread waiter_thread{};
-  consumer_type& consumer{};
-
-  void stop() {
-    close();
-    waiter_thread.join();
-  }
-
-  void init_webrtc() {
-    signaling_thread = rtc::Thread::CreateWithSocketServer();
-    signaling_thread->Start();
-
-    rtc::LogMessage::LogToDebug(rtc::LS_WARNING);
-    pc_factory = webrtc::CreatePeerConnectionFactory(
-        nullptr, nullptr, signaling_thread.get(), nullptr,
-        webrtc::CreateBuiltinAudioEncoderFactory(),
-        webrtc::CreateBuiltinAudioDecoderFactory(),
-        webrtc::CreateBuiltinVideoEncoderFactory(),
-        webrtc::CreateBuiltinVideoDecoderFactory(), nullptr, nullptr);
-
-    if (!pc_factory) {
-      std::cout << "Failed to create PeerConnectionFactory\n";
-      std::exit(-1);
-    }
-  }
+  void start(server_type& server) { this->server = &server; }
 
   void close() {
     std::cout << "[INFO] Closing Peer\n";
@@ -104,32 +53,11 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
 
     if (!connection.expired()) {
       std::cout << "[INFO] Explicitly closing websocket\n";
-      server.close(connection, websocketpp::close::status::going_away,
-                   "Exited from console");
+      server->close(connection, websocketpp::close::status::going_away,
+                    "Exited from console");
 
       connection = {};
     }
-  }
-
-  void create_peer() {
-    webrtc::PeerConnectionInterface::RTCConfiguration config{};
-    config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
-    webrtc::PeerConnectionInterface::IceServer turner{};
-    turner.uri = "turn:54.200.166.206:3478?transport=tcp";
-    turner.username = "user";
-    turner.password = "root";
-    config.servers.emplace_back(std::move(turner));
-
-    const auto maybe_pc = pc_factory->CreatePeerConnectionOrError(
-        config, webrtc::PeerConnectionDependencies{this});
-
-    if (!maybe_pc.ok()) {
-      std::cout << "Failed to create PeerConnection\n";
-      std::exit(-1);
-    }
-
-    std::cout << "[INFO] Created Peer\n";
-    peer_connection = std::move(maybe_pc.value());
   }
 
   void on_message(websocketpp::connection_hdl hdl, message_ptr message) {
@@ -188,9 +116,57 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
       connection = hdl;
     } else {
       std::cout << "[WARNING] Rejecting connection\n";
-      server.close(hdl, websocketpp::close::status::subprotocol_error,
-                   "Rejected connection; other client already present");
+      server->close(hdl, websocketpp::close::status::subprotocol_error,
+                    "Rejected connection; other client already present");
     }
+  }
+
+ private:
+  websocketpp::connection_hdl connection{};
+  std::unique_ptr<rtc::Thread> signaling_thread{};
+  rtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> pc_factory{};
+  rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection{};
+  rtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track{};
+  consumer_type& consumer{};
+  server_type* server{};
+
+  void init_webrtc() {
+    signaling_thread = rtc::Thread::CreateWithSocketServer();
+    signaling_thread->Start();
+
+    rtc::LogMessage::LogToDebug(rtc::LS_WARNING);
+    pc_factory = webrtc::CreatePeerConnectionFactory(
+        nullptr, nullptr, signaling_thread.get(), nullptr,
+        webrtc::CreateBuiltinAudioEncoderFactory(),
+        webrtc::CreateBuiltinAudioDecoderFactory(),
+        webrtc::CreateBuiltinVideoEncoderFactory(),
+        webrtc::CreateBuiltinVideoDecoderFactory(), nullptr, nullptr);
+
+    if (!pc_factory) {
+      std::cout << "Failed to create PeerConnectionFactory\n";
+      std::exit(-1);
+    }
+  }
+
+  void create_peer() {
+    webrtc::PeerConnectionInterface::RTCConfiguration config{};
+    config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
+    webrtc::PeerConnectionInterface::IceServer turner{};
+    turner.uri = "turn:54.200.166.206:3478?transport=tcp";
+    turner.username = "user";
+    turner.password = "root";
+    config.servers.emplace_back(std::move(turner));
+
+    const auto maybe_pc = pc_factory->CreatePeerConnectionOrError(
+        config, webrtc::PeerConnectionDependencies{this});
+
+    if (!maybe_pc.ok()) {
+      std::cout << "Failed to create PeerConnection\n";
+      std::exit(-1);
+    }
+
+    std::cout << "[INFO] Created Peer\n";
+    peer_connection = std::move(maybe_pc.value());
   }
 
   void OnSignalingChange(
@@ -262,8 +238,8 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
     inner_blob["sdpMid"] = candidate->sdp_mid();
     inner_blob["sdpMLineIndex"] = candidate->sdp_mline_index();
     data["iceCandidate"] = inner_blob;
-    server.send(connection, boost::json::serialize(data),
-                websocketpp::frame::opcode::text);
+    server->send(connection, boost::json::serialize(data),
+                 websocketpp::frame::opcode::text);
   }
 
   void OnConnectionChange(
@@ -305,8 +281,8 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
     data["sdp"] = sdp;
     boost::json::object msg{};
     msg["answer"] = data;
-    server.send(connection, boost::json::serialize(msg),
-                websocketpp::frame::opcode::text);
+    server->send(connection, boost::json::serialize(msg),
+                 websocketpp::frame::opcode::text);
   }
 
   void OnSuccess() override { std::cout << "[INFO] Succeeded\n"; }
@@ -327,12 +303,52 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
   }
 };
 
-template<bool exclusive_mode, unsigned port>
+template <typename implementer_type>
 class socket_server {
-public:
-  
+ public:
+  socket_server(implementer_type& implementer, std::mutex& exit_lock)
+      : implementer{implementer},
+        server{},
+        connection{},
+        waiter_thread{[&exit_lock, this] {
+          exit_lock.lock();
+          server.stop_listening();
+          this->implementer.close();
+          server.stop();
+          exit_lock.unlock();
+        }} {}
 
-private:
+  void start(unsigned port) {
+    server.init_asio();
+    server.set_message_handler(
+        websocketpp::lib::bind(&socket_server::on_message, this, ::_1, ::_2));
+
+    server.set_open_handler(
+        websocketpp::lib::bind(&socket_server::on_open, this, ::_1));
+
+    server.listen(port);
+    server.start_accept();
+    implementer.start(server);
+    server.run();
+    stop();
+  }
+
+ private:
+  implementer_type& implementer;
+  server_type server{};
+  websocketpp::connection_hdl connection{};
+  std::thread waiter_thread{};
+
+  void stop() {
+    implementer.close();
+    waiter_thread.join();
+  }
+
+  void on_message(websocketpp::connection_hdl hdl, message_ptr message) {
+    implementer.on_message(hdl, message);
+  }
+
+  void on_open(websocketpp::connection_hdl hdl) { implementer.on_open(hdl); }
 };
 
 struct null_consumer {
@@ -363,11 +379,11 @@ int main() {
     exit_lock.unlock();
 
   using presenter = webrtc_observer<null_consumer>;
-  const auto presenter_stream =
-      rtc::make_ref_counted<presenter>(consumer, exit_lock);
+  const auto presenter_stream = rtc::make_ref_counted<presenter>(consumer);
 
   try {
-    presenter_stream->start_signal_server();
+    socket_server presenter_server{*presenter_stream, exit_lock};
+    presenter_server.start(9002);
   } catch (const websocketpp::exception& error) {
     std::cout << "[ERROR] Websocket: " << error.what() << "\n";
     throw;
