@@ -42,6 +42,11 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
 
   void start(server_type& server) { this->server = &server; }
 
+  void add_track(
+      const rtc::scoped_refptr<webrtc::MediaStreamTrackInterface>& track) {
+    this->track = track;
+  }
+
   void close() {
     std::cout << "[INFO] Closing Peer\n";
     track = nullptr;
@@ -167,6 +172,15 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
 
     std::cout << "[INFO] Created Peer\n";
     peer_connection = std::move(maybe_pc.value());
+
+    if (track) {
+      const std::vector<std::string> stream_ids{};
+      const auto result = peer_connection->AddTrack(track, stream_ids);
+      if (!result.ok()) {
+        std::cout << "[ERROR] Could not add track to audience: "
+                  << result.error().message() << "\n";
+      }
+    }
   }
 
   void OnSignalingChange(
@@ -387,10 +401,13 @@ struct presenter_consumer {
   void on_track(
       rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
     std::cout << "[INFO] Presenter consumer saw new track\n";
+    audience->add_track(transceiver->receiver()->track());
   }
 };
 
 }  // namespace receiver
+
+// TODO: THE AUDIENCE MUST ADD AN EMPTY DATA CHANNEL OR THE HANDSHAKE WILL FAIL
 
 int main() {
   using namespace receiver;
