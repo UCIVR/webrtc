@@ -31,12 +31,12 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
                         public webrtc::CreateSessionDescriptionObserver {
  public:
   webrtc_observer(consumer_type& consumer)
-      : peer_connection{},
-        pc_factory{},
+      : connection{},
         signaling_thread{},
+        pc_factory{},
+        peer_connection{},
         track{},
-        consumer{consumer},
-        connection{} {
+        consumer{consumer} {
     init_webrtc();
   }
 
@@ -312,25 +312,34 @@ class socket_server {
         connection{},
         waiter_thread{[&exit_lock, this] {
           exit_lock.lock();
+          std::cout << "1\n";
           server.stop_listening();
+          std::cout << "2\n";
           this->implementer.close();
+          std::cout << "3\n";
           server.stop();
+          std::cout << "4\n";
           exit_lock.unlock();
         }} {}
 
   void start(unsigned port) {
-    server.init_asio();
-    server.set_message_handler(
-        websocketpp::lib::bind(&socket_server::on_message, this, ::_1, ::_2));
+    try {
+      server.init_asio();
+      server.set_message_handler(
+          websocketpp::lib::bind(&socket_server::on_message, this, ::_1, ::_2));
 
-    server.set_open_handler(
-        websocketpp::lib::bind(&socket_server::on_open, this, ::_1));
+      server.set_open_handler(
+          websocketpp::lib::bind(&socket_server::on_open, this, ::_1));
 
-    server.listen(port);
-    server.start_accept();
-    implementer.start(server);
-    server.run();
-    stop();
+      server.listen(port);
+      server.start_accept();
+      implementer.start(server);
+      server.run();
+      stop();
+    } catch (const websocketpp::exception& error) {
+      std::cout << "[ERROR] Websocket: " << error.what() << "\n";
+      throw;
+    }
   }
 
  private:
@@ -358,12 +367,34 @@ struct null_consumer {
   }
 };
 
+struct presenter_consumer {
+  null_consumer consumer;
+
+  using audience_type = webrtc_observer<null_consumer>;
+  decltype(rtc::make_ref_counted<audience_type>(consumer)) audience;
+
+  socket_server<audience_type> server;
+  std::thread server_thread;
+
+  presenter_consumer(std::mutex& exit_lock, unsigned port)
+      : consumer{},
+        audience{rtc::make_ref_counted<audience_type>(consumer)},
+        server{*audience, exit_lock},
+        server_thread{[this, port] { server.start(port); }} {}
+
+  ~presenter_consumer() { server_thread.join(); }
+
+  void on_track(
+      rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
+    std::cout << "[INFO] Presenter consumer saw new track\n";
+  }
+};
+
 }  // namespace receiver
 
 int main() {
   using namespace receiver;
 
-  null_consumer consumer{};
   std::mutex exit_lock{};
   std::thread input_thread{[&exit_lock] {
     exit_lock.lock();
@@ -378,16 +409,10 @@ int main() {
   while (exit_lock.try_lock())
     exit_lock.unlock();
 
-  using presenter = webrtc_observer<null_consumer>;
+  presenter_consumer consumer{exit_lock, 9003};
+  using presenter = webrtc_observer<presenter_consumer>;
   const auto presenter_stream = rtc::make_ref_counted<presenter>(consumer);
-
-  try {
-    socket_server presenter_server{*presenter_stream, exit_lock};
-    presenter_server.start(9002);
-  } catch (const websocketpp::exception& error) {
-    std::cout << "[ERROR] Websocket: " << error.what() << "\n";
-    throw;
-  }
-
+  socket_server presenter_server{*presenter_stream, exit_lock};
+  presenter_server.start(9002);
   input_thread.join();
 }
