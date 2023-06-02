@@ -2,8 +2,6 @@
 #include <api/peer_connection_interface.h>
 #include <rtc_base/thread.h>
 
-#include <atomic>
-#include <chrono>
 #include <iostream>
 #include <mutex>
 #include <thread>
@@ -73,7 +71,6 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
   consumer_type& consumer{};
 
   void stop() {
-    track = nullptr;
     close();
     waiter_thread.join();
   }
@@ -91,16 +88,22 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
         webrtc::CreateBuiltinVideoDecoderFactory(), nullptr, nullptr);
 
     if (!pc_factory) {
-      std::cerr << "Failed to create PeerConnectionFactory\n";
+      std::cout << "Failed to create PeerConnectionFactory\n";
       std::exit(-1);
     }
   }
 
   void close() {
-    if (!connection.expired()) {
-      std::cerr << "[INFO] Closing Peer";
+    std::cout << "[INFO] Closing Peer\n";
+    track = nullptr;
+    if (peer_connection) {
+      std::cout << "[INFO] Closing PeerConnection\n";
       peer_connection->Close();
       peer_connection = nullptr;
+    }
+
+    if (!connection.expired()) {
+      std::cout << "[INFO] Explicitly closing websocket\n";
       server.close(connection, websocketpp::close::status::going_away,
                    "Exited from console");
 
@@ -121,22 +124,22 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
         config, webrtc::PeerConnectionDependencies{this});
 
     if (!maybe_pc.ok()) {
-      std::cerr << "Failed to create PeerConnection\n";
+      std::cout << "Failed to create PeerConnection\n";
       std::exit(-1);
     }
 
-    std::cerr << "[INFO] Created Peer\n";
+    std::cout << "[INFO] Created Peer\n";
     peer_connection = std::move(maybe_pc.value());
   }
 
   void on_message(websocketpp::connection_hdl hdl, message_ptr message) {
     if (hdl.lock() != connection.lock()) {
-      std::cerr << "Wrong socket!\n";
+      std::cout << "Wrong socket!\n";
       return;
     }
 
     if (message->get_opcode() != 1) {
-      std::cerr << "I don't know how to use this frame\n";
+      std::cout << "I don't know how to use this frame\n";
       return;
     }
 
@@ -164,7 +167,7 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
                                      &error)};
 
       if (!candidate) {
-        std::cerr << "Failed to parse ICE candidate: " << error.description
+        std::cout << "Failed to parse ICE candidate: " << error.description
                   << "\n";
         return;
       }
@@ -172,7 +175,7 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
       peer_connection->AddIceCandidate(
           std::move(candidate), [](webrtc::RTCError error) {
             if (!error.ok()) {
-              std::cerr << "[ERROR] Failed to set ICE candidate with error: "
+              std::cout << "[ERROR] Failed to set ICE candidate with error: "
                         << error.message() << "\n";
             }
           });
@@ -181,10 +184,10 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
 
   void on_open(websocketpp::connection_hdl hdl) {
     if (connection.expired()) {
-      std::cerr << "[INFO] Connection opened\n";
+      std::cout << "[INFO] Connection opened\n";
       connection = hdl;
     } else {
-      std::cerr << "[WARNING] Rejecting connection\n";
+      std::cout << "[WARNING] Rejecting connection\n";
       server.close(hdl, websocketpp::close::status::subprotocol_error,
                    "Rejected connection; other client already present");
     }
@@ -198,7 +201,7 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
 
   void OnIceGatheringChange(
       webrtc::PeerConnectionInterface::IceGatheringState state) override {
-    std::cerr << "[WARNING] ICE gathering state change: " << [state] {
+    std::cout << "[WARNING] ICE gathering state change: " << [state] {
       switch (state) {
         case decltype(state)::kIceGatheringComplete:
           return "Complete";
@@ -214,7 +217,7 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
 
   void OnStandardizedIceConnectionChange(
       webrtc::PeerConnectionInterface::IceConnectionState state) override {
-    std::cerr << "[INFO] ICE connection state change: " << [this, state] {
+    std::cout << "[INFO] ICE connection state change: " << [this, state] {
       switch (state) {
         case decltype(state)::kIceConnectionChecking:
           return "Checking";
@@ -249,7 +252,7 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
   void OnIceCandidate(const webrtc::IceCandidateInterface* candidate) override {
     std::string blob{};
     if (!candidate->ToString(&blob)) {
-      std::cerr << "[ERROR] Failed to serialize ICE candidate\n";
+      std::cout << "[ERROR] Failed to serialize ICE candidate\n";
       return;
     }
 
@@ -265,7 +268,7 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
 
   void OnConnectionChange(
       webrtc::PeerConnectionInterface::PeerConnectionState state) {
-    std::cerr << "[INFO] Connection state change: " << [state] {
+    std::cout << "[INFO] Connection state change: " << [state] {
       switch (state) {
         case decltype(state)::kNew:
           return "New";
@@ -289,13 +292,13 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
   }
 
   void OnSuccess(webrtc::SessionDescriptionInterface* desc) override {
-    std::cerr << "[INFO] Created local session description\n";
+    std::cout << "[INFO] Created local session description\n";
     peer_connection->SetLocalDescription(this, desc);
     boost::json::object data{};
     data["type"] = webrtc::SdpTypeToString(desc->GetType());
     std::string sdp{};
     if (!desc->ToString(&sdp)) {
-      std::cerr << "[ERROR] Failed to serialize SDP\n";
+      std::cout << "[ERROR] Failed to serialize SDP\n";
       return;
     }
 
@@ -306,28 +309,36 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
                 websocketpp::frame::opcode::text);
   }
 
-  void OnSuccess() override { std::cerr << "[INFO] Succeeded\n"; }
+  void OnSuccess() override { std::cout << "[INFO] Succeeded\n"; }
 
   void OnFailure(webrtc::RTCError error) override {
-    std::cerr << "[ERROR] Failed: " << error.message() << "\n";
+    std::cout << "[ERROR] Failed: " << error.message() << "\n";
   }
 
   void OnTrack(rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver)
       override {
-    std::cerr << "[INFO] Added track of type: "
+    std::cout << "[INFO] Added track of type: "
               << cricket::MediaTypeToString(transceiver->media_type()) << "\n";
     track = transceiver->receiver()->track();
     if (track->enabled())
-      std::cerr << "[INFO] Track is enabled\n";
+      std::cout << "[INFO] Track is enabled\n";
 
     consumer.on_track(transceiver);
   }
 };
 
+template<bool exclusive_mode, unsigned port>
+class socket_server {
+public:
+  
+
+private:
+};
+
 struct null_consumer {
   void on_track(
       rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
-    std::cerr << "[INFO] Null consumer saw new track\n";
+    std::cout << "[INFO] Null consumer saw new track\n";
   }
 };
 
@@ -335,28 +346,19 @@ struct null_consumer {
 
 int main() {
   using namespace receiver;
-  using namespace std::chrono_literals;
 
   null_consumer consumer{};
   std::mutex exit_lock{};
-  std::atomic_bool force_exit{};
-  std::thread input_thread{[&force_exit] {
+  std::thread input_thread{[&exit_lock] {
+    exit_lock.lock();
     std::string input{};
     while (input != "exit" && !std::cin.eof())
       std::cin >> input;
 
-    force_exit = true;
-  }};
-
-  std::thread exit_thread{[&exit_lock, &force_exit] {
-    exit_lock.lock();
-    while (!force_exit)
-      std::this_thread::sleep_for(32ms);
-
     exit_lock.unlock();
   }};
 
-  // Janky, but the idea is to wait for the lock to be held by exit_thread;
+  // Janky, but the idea is to wait for the lock to be held by input_thread;
   while (exit_lock.try_lock())
     exit_lock.unlock();
 
@@ -367,12 +369,9 @@ int main() {
   try {
     presenter_stream->start_signal_server();
   } catch (const websocketpp::exception& error) {
-    std::cerr << error.what() << "\n";
-    force_exit = true;
+    std::cout << "[ERROR] Websocket: " << error.what() << "\n";
+    throw;
   }
 
   input_thread.join();
-  exit_thread.join();
-
-  return force_exit ? -1 : 0;
 }
