@@ -2,10 +2,15 @@
 #include <api/peer_connection_interface.h>
 #include <rtc_base/thread.h>
 
+#include <atomic>
+#include <chrono>
+#include <iostream>
+#include <mutex>
+#include <thread>
+
 #define BOOST_ALL_NO_LIB
 #include <boost/json.hpp>
 #include <boost/json/src.hpp>
-#include <iostream>
 
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
@@ -23,11 +28,11 @@ using websocketpp::lib::placeholders::_2;
 
 namespace receiver {
 template <typename consumer_type>
-class observer : public webrtc::PeerConnectionObserver,
-                 public webrtc::SetSessionDescriptionObserver,
-                 public webrtc::CreateSessionDescriptionObserver {
+class webrtc_observer : public webrtc::PeerConnectionObserver,
+                        public webrtc::SetSessionDescriptionObserver,
+                        public webrtc::CreateSessionDescriptionObserver {
  public:
-  observer(consumer_type& consumer, std::mutex& exit_lock)
+  webrtc_observer(consumer_type& consumer, std::mutex& exit_lock)
       : server{},
         peer_connection{},
         track{},
@@ -42,9 +47,43 @@ class observer : public webrtc::PeerConnectionObserver,
         consumer{consumer} {}
 
   void start_signal_server() {
-    const auto signaling_thread = rtc::Thread::CreateWithSocketServer();
+    init_webrtc();
+
+    server.init_asio();
+    server.set_message_handler(
+        websocketpp::lib::bind(&webrtc_observer::on_message, this, ::_1, ::_2));
+
+    server.set_open_handler(
+        websocketpp::lib::bind(&webrtc_observer::on_open, this, ::_1));
+
+    server.listen(9002);
+    server.start_accept();
+    server.run();
+    stop();
+  }
+
+ private:
+  server_type server{};
+  std::unique_ptr<rtc::Thread> signaling_thread{};
+  rtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> pc_factory{};
+  rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection{};
+  rtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track{};
+  websocketpp::connection_hdl connection{};
+  std::thread waiter_thread{};
+  consumer_type& consumer{};
+
+  void stop() {
+    track = nullptr;
+    close();
+    waiter_thread.join();
+  }
+
+  void init_webrtc() {
+    signaling_thread = rtc::Thread::CreateWithSocketServer();
     signaling_thread->Start();
-    const auto pc_factory = webrtc::CreatePeerConnectionFactory(
+
+    rtc::LogMessage::LogToDebug(rtc::LS_WARNING);
+    pc_factory = webrtc::CreatePeerConnectionFactory(
         nullptr, nullptr, signaling_thread.get(), nullptr,
         webrtc::CreateBuiltinAudioEncoderFactory(),
         webrtc::CreateBuiltinAudioDecoderFactory(),
@@ -55,7 +94,21 @@ class observer : public webrtc::PeerConnectionObserver,
       std::cerr << "Failed to create PeerConnectionFactory\n";
       std::exit(-1);
     }
+  }
 
+  void close() {
+    if (!connection.expired()) {
+      std::cerr << "[INFO] Closing Peer";
+      peer_connection->Close();
+      peer_connection = nullptr;
+      server.close(connection, websocketpp::close::status::going_away,
+                   "Exited from console");
+
+      connection = {};
+    }
+  }
+
+  void create_peer() {
     webrtc::PeerConnectionInterface::RTCConfiguration config{};
     config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
     webrtc::PeerConnectionInterface::IceServer turner{};
@@ -72,43 +125,8 @@ class observer : public webrtc::PeerConnectionObserver,
       std::exit(-1);
     }
 
+    std::cerr << "[INFO] Created Peer\n";
     peer_connection = std::move(maybe_pc.value());
-
-    server.init_asio();
-    server.set_message_handler(
-        websocketpp::lib::bind(&observer::on_message, this, ::_1, ::_2));
-
-    server.set_open_handler(
-        websocketpp::lib::bind(&observer::on_open, this, ::_1));
-
-    server.listen(9002);
-    server.start_accept();
-    server.run();
-    stop();
-  }
-
- private:
-  server_type server{};
-  rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection{};
-  rtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track{};
-  websocketpp::connection_hdl connection{};
-  std::thread waiter_thread{};
-  consumer_type& consumer{};
-
-  void stop() {
-    track = nullptr;
-    peer_connection->Close();
-    peer_connection = nullptr;
-    waiter_thread.join();
-  }
-
-  void close() {
-    if (!connection.expired()) {
-      server.close(connection, websocketpp::close::status::going_away,
-                   "Exited from console");
-
-      connection = {};
-    }
   }
 
   void on_message(websocketpp::connection_hdl hdl, message_ptr message) {
@@ -126,6 +144,7 @@ class observer : public webrtc::PeerConnectionObserver,
     if (payload.contains("offer")) {
       auto offer = payload["offer"].as_object();
 
+      create_peer();
       peer_connection->SetRemoteDescription(
           this, webrtc::CreateSessionDescription(
                     webrtc::SdpTypeFromString(offer["type"].as_string().c_str())
@@ -316,25 +335,34 @@ struct null_consumer {
 
 int main() {
   using namespace receiver;
+  using namespace std::chrono_literals;
 
   null_consumer consumer{};
   std::mutex exit_lock{};
-
   std::atomic_bool force_exit{};
-  std::thread input_thread{[&exit_lock, &force_exit] {
-    exit_lock.lock();
+  std::thread input_thread{[&force_exit] {
     std::string input{};
-    while (input != "exit" && !std::cin.eof() && !force_exit)
+    while (input != "exit" && !std::cin.eof())
       std::cin >> input;
+
+    force_exit = true;
+  }};
+
+  std::thread exit_thread{[&exit_lock, &force_exit] {
+    exit_lock.lock();
+    while (!force_exit)
+      std::this_thread::sleep_for(32ms);
+
     exit_lock.unlock();
   }};
 
-  // Janky, but the idea is to wait for the lock to be held by input_thread;
+  // Janky, but the idea is to wait for the lock to be held by exit_thread;
   while (exit_lock.try_lock())
     exit_lock.unlock();
 
+  using presenter = webrtc_observer<null_consumer>;
   const auto presenter_stream =
-      rtc::make_ref_counted<observer<null_consumer>>(consumer, exit_lock);
+      rtc::make_ref_counted<presenter>(consumer, exit_lock);
 
   try {
     presenter_stream->start_signal_server();
@@ -344,6 +372,7 @@ int main() {
   }
 
   input_thread.join();
+  exit_thread.join();
 
   return force_exit ? -1 : 0;
 }
