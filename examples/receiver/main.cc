@@ -153,7 +153,7 @@ class observer : public webrtc::PeerConnectionObserver,
       peer_connection->AddIceCandidate(
           std::move(candidate), [](webrtc::RTCError error) {
             if (!error.ok()) {
-              std::cout << "Failed to set ICE candidate with error: "
+              std::cerr << "[ERROR] Failed to set ICE candidate with error: "
                         << error.message() << "\n";
             }
           });
@@ -162,10 +162,10 @@ class observer : public webrtc::PeerConnectionObserver,
 
   void on_open(websocketpp::connection_hdl hdl) {
     if (connection.expired()) {
-      std::cout << "Connection opened\n";
-      connection = server.get_con_from_hdl(hdl);
+      std::cerr << "[INFO] Connection opened\n";
+      connection = hdl;
     } else {
-      std::cout << "Rejecting connection\n";
+      std::cerr << "[WARNING] Rejecting connection\n";
       server.close(hdl, websocketpp::close::status::subprotocol_error,
                    "Rejected connection; other client already present");
     }
@@ -179,7 +179,7 @@ class observer : public webrtc::PeerConnectionObserver,
 
   void OnIceGatheringChange(
       webrtc::PeerConnectionInterface::IceGatheringState state) override {
-    std::cout << "ICE gathering state change: " << [state] {
+    std::cerr << "[WARNING] ICE gathering state change: " << [state] {
       switch (state) {
         case decltype(state)::kIceGatheringComplete:
           return "Complete";
@@ -195,7 +195,7 @@ class observer : public webrtc::PeerConnectionObserver,
 
   void OnStandardizedIceConnectionChange(
       webrtc::PeerConnectionInterface::IceConnectionState state) override {
-    std::cout << "ICE connection state change: " << [this, state] {
+    std::cerr << "[INFO] ICE connection state change: " << [this, state] {
       switch (state) {
         case decltype(state)::kIceConnectionChecking:
           return "Checking";
@@ -230,7 +230,7 @@ class observer : public webrtc::PeerConnectionObserver,
   void OnIceCandidate(const webrtc::IceCandidateInterface* candidate) override {
     std::string blob{};
     if (!candidate->ToString(&blob)) {
-      std::cerr << "Failed to serialize ICE candidate\n";
+      std::cerr << "[ERROR] Failed to serialize ICE candidate\n";
       return;
     }
 
@@ -246,7 +246,7 @@ class observer : public webrtc::PeerConnectionObserver,
 
   void OnConnectionChange(
       webrtc::PeerConnectionInterface::PeerConnectionState state) {
-    std::cout << "Connection state change: " << [state] {
+    std::cerr << "[INFO] Connection state change: " << [state] {
       switch (state) {
         case decltype(state)::kNew:
           return "New";
@@ -270,13 +270,13 @@ class observer : public webrtc::PeerConnectionObserver,
   }
 
   void OnSuccess(webrtc::SessionDescriptionInterface* desc) override {
-    std::cout << "Created local session description\n";
+    std::cerr << "[INFO] Created local session description\n";
     peer_connection->SetLocalDescription(this, desc);
     boost::json::object data{};
     data["type"] = webrtc::SdpTypeToString(desc->GetType());
     std::string sdp{};
     if (!desc->ToString(&sdp)) {
-      std::cerr << "Failed to serialize SDP\n";
+      std::cerr << "[ERROR] Failed to serialize SDP\n";
       return;
     }
 
@@ -287,19 +287,19 @@ class observer : public webrtc::PeerConnectionObserver,
                 websocketpp::frame::opcode::text);
   }
 
-  void OnSuccess() override { std::cerr << "Succeeded!\n"; }
+  void OnSuccess() override { std::cerr << "[INFO] Succeeded\n"; }
 
   void OnFailure(webrtc::RTCError error) override {
-    std::cerr << "Failed: " << error.message() << "\n";
+    std::cerr << "[ERROR] Failed: " << error.message() << "\n";
   }
 
   void OnTrack(rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver)
       override {
-    std::cout << "Added track of type: "
+    std::cerr << "[INFO] Added track of type: "
               << cricket::MediaTypeToString(transceiver->media_type()) << "\n";
     track = transceiver->receiver()->track();
     if (track->enabled())
-      std::cout << "Track is enabled\n";
+      std::cerr << "[INFO] Track is enabled\n";
 
     consumer.on_track(transceiver);
   }
@@ -308,7 +308,7 @@ class observer : public webrtc::PeerConnectionObserver,
 struct null_consumer {
   void on_track(
       rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
-    std::cout << "Null consumer saw new track\n";
+    std::cerr << "[INFO] Null consumer saw new track\n";
   }
 };
 
