@@ -42,9 +42,16 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
 
   void start(server_type& server) { this->server = &server; }
 
-  void add_track(
+  void set_track(
       const rtc::scoped_refptr<webrtc::MediaStreamTrackInterface>& track) {
-    this->track = track;
+    const std::vector<std::string> stream_ids{"dummyStream"};
+    const auto result = peer_connection->AddTrack(track, stream_ids);
+    if (!result.ok()) {
+      std::cout << "[ERROR] Could not add track to audience: "
+                << result.error().message() << "\n";
+    } else {
+      std::cout << "[INFO] Added track to fresh peer\n";
+    }
   }
 
   void close() {
@@ -172,22 +179,16 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
 
     std::cout << "[INFO] Created Peer\n";
     peer_connection = std::move(maybe_pc.value());
-
-    if (track) {
-      const std::vector<std::string> stream_ids{};
-      const auto result = peer_connection->AddTrack(track, stream_ids);
-      if (!result.ok()) {
-        std::cout << "[ERROR] Could not add track to audience: "
-                  << result.error().message() << "\n";
-      }
-    }
   }
 
   void OnSignalingChange(
       webrtc::PeerConnectionInterface::SignalingState new_state) override {}
 
   void OnDataChannel(
-      rtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) override {}
+      rtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) override {
+    std::cout << "[WARNING] Added data channel: " << data_channel->label()
+              << "\n";
+  }
 
   void OnIceGatheringChange(
       webrtc::PeerConnectionInterface::IceGatheringState state) override {
@@ -292,6 +293,7 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
       return;
     }
 
+    std::cout << "[INFO] " << sdp << "\n";
     data["sdp"] = sdp;
     boost::json::object msg{};
     msg["answer"] = data;
@@ -390,18 +392,22 @@ struct presenter_consumer {
   socket_server<audience_type> server;
   std::thread server_thread;
 
+  rtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track;
+
   presenter_consumer(std::mutex& exit_lock, unsigned port)
       : consumer{},
         audience{rtc::make_ref_counted<audience_type>(consumer)},
         server{*audience, exit_lock},
-        server_thread{[this, port] { server.start(port); }} {}
+        server_thread{[this, port] { server.start(port); }},
+        track{} {}
 
   ~presenter_consumer() { server_thread.join(); }
 
   void on_track(
       rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
     std::cout << "[INFO] Presenter consumer saw new track\n";
-    audience->add_track(transceiver->receiver()->track());
+    track = transceiver->receiver()->track();
+    // audience->set_track(transceiver->receiver()->track());
   }
 };
 
