@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <set>
 #include <thread>
 
 #define BOOST_ALL_NO_LIB
@@ -139,13 +140,46 @@ class source_server : public socket_server<source_server> {
  private:
   decltype(server)::connection_ptr connection{};
 };
+
+class sink_server : public socket_server<sink_server> {
+ public:
+  template <typename... types>
+  void on_open(websocketpp::connection_hdl hdl, types&&...) {
+    const auto new_connection = server.get_con_from_hdl(hdl);
+    connections.insert(new_connection);
+  }
+
+  void on_close(websocketpp::connection_hdl hdl) {
+    const auto new_connection = server.get_con_from_hdl(hdl);
+    if (connections.find(new_connection) != connections.end()) {
+      log(level::warning, "source disconnected");
+      connections.erase(new_connection);
+    }
+  }
+
+  template <typename... types>
+  void on_message(types&&...) {}
+
+  void close_all() {
+    log(level::info, "closing source connections");
+    for (const auto connection : connections) {
+      connection->close(websocketpp::close::status::going_away,
+                        "Server shutting down");
+    }
+
+    connections.clear();
+  }
+
+ private:
+  std::set<decltype(server)::connection_ptr> connections{};
+};
 }  // namespace receiver
 
 int main() {
   using namespace receiver;
 
   source_server source{};
-  source_server sink{};
+  sink_server sink{};
   source.start(9002);
   sink.start(9003);
 
