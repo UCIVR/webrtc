@@ -106,7 +106,7 @@ class socket_server {
 
   void shut_down() {
     server.stop_listening();
-    self().close_all();
+    //self().close_all();
     server.stop();
     server_thread.join();
   }
@@ -136,26 +136,29 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
                         public webrtc::SetSessionDescriptionObserver {
  public:
   webrtc_observer(server_type::connection_ptr signal_socket)
-      : peer{create_peer(this)}, signal_socket{signal_socket} {
+      : factory{}, peer{create_peer(this)}, signal_socket{signal_socket} {
     signal_socket->set_message_handler(
         [this](websocketpp::connection_hdl hdl,
                server_type::message_ptr message) { on_message(hdl, message); });
   }
+
+  ~webrtc_observer() { close(); }
 
   template <typename... types>
   static auto make(types&&... args) {
     return rtc::make_ref_counted<webrtc_observer>(std::forward<types>(args)...);
   }
 
-  void close() { peer->Close(); }
-
  private:
+  webrtc_factory factory;
   rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer;
   server_type::connection_ptr signal_socket;
 
+  void close() { peer->Close(); }
+
   static rtc::scoped_refptr<webrtc::PeerConnectionInterface> create_peer(
       webrtc_observer* host) {
-    const auto& [signal_thread, factory] = webrtc_factory{};
+    const auto& [signal_thread, factory] = host->factory;
     webrtc::PeerConnectionInterface::RTCConfiguration config{};
     config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
     webrtc::PeerConnectionInterface::IceServer turner{};
@@ -325,6 +328,9 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
   }
 };
 
+using peer_ptr =
+    rtc::scoped_refptr<rtc::FinalRefCountedObject<webrtc_observer>>;
+
 class source_server : public socket_server<source_server> {
  public:
   source_server() : socket_server<source_server>{}, connection{}, peer{} {}
@@ -338,15 +344,15 @@ class source_server : public socket_server<source_server> {
     }
 
     connection = new_connection;
-    peer = webrtc_observer::make(factory.get(), connection);
+    peer = webrtc_observer::make(connection);
   }
 
   void on_close(websocketpp::connection_hdl hdl) {
     const auto new_connection = server.get_con_from_hdl(hdl);
     if (connection == new_connection) {
       log(level::warning, "source disconnected");
-      close_peer();
       connection = nullptr;
+      peer = nullptr;
     }
   }
 
@@ -356,23 +362,16 @@ class source_server : public socket_server<source_server> {
   void close_all() {
     if (connection) {
       log(level::info, "closing source connection");
-      close_peer();
       connection->close(websocketpp::close::status::going_away,
                         "Server shutting down");
+
+      peer = nullptr;
     }
   }
 
  private:
   decltype(server)::connection_ptr connection;
-  rtc::scoped_refptr<rtc::FinalRefCountedObject<webrtc_observer>> peer;
-
-  void close_peer() {
-    if (!peer)
-      return;
-
-    peer->close();
-    peer = nullptr;
-  }
+  peer_ptr peer;
 };
 
 class sink_server : public socket_server<sink_server> {
@@ -380,14 +379,19 @@ class sink_server : public socket_server<sink_server> {
   template <typename... types>
   void on_open(websocketpp::connection_hdl hdl, types&&...) {
     const auto new_connection = server.get_con_from_hdl(hdl);
-    connections.insert(new_connection);
+    const auto maybe = connections.find(new_connection);
+    if (maybe == connections.end())
+      connections[new_connection] = webrtc_observer::make(new_connection);
   }
 
   void on_close(websocketpp::connection_hdl hdl) {
     const auto new_connection = server.get_con_from_hdl(hdl);
-    if (connections.find(new_connection) != connections.end()) {
+    auto maybe = connections.find(new_connection);
+    if (maybe != connections.end()) {
       log(level::warning, "source disconnected");
-      connections.erase(new_connection);
+      auto& [connection, peer] = *maybe;
+      peer = nullptr;
+      connections.erase(maybe);
     }
   }
 
@@ -396,16 +400,18 @@ class sink_server : public socket_server<sink_server> {
 
   void close_all() {
     log(level::info, "closing source connections");
-    for (const auto connection : connections) {
+    for (auto& [connection, peer] : connections) {
       connection->close(websocketpp::close::status::going_away,
                         "Server shutting down");
+
+      peer = nullptr;
     }
 
     connections.clear();
   }
 
  private:
-  std::set<decltype(server)::connection_ptr> connections{};
+  std::map<decltype(server)::connection_ptr, peer_ptr> connections{};
 };
 
 template <typename type>
