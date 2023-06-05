@@ -131,8 +131,210 @@ class socket_server {
   void close_all() {}
 };
 
+class webrtc_observer : public webrtc::PeerConnectionObserver,
+                        public webrtc::CreateSessionDescriptionObserver,
+                        public webrtc::SetSessionDescriptionObserver {
+ public:
+  webrtc_observer(webrtc::PeerConnectionFactoryInterface* factory,
+                  server_type::connection_ptr signal_socket)
+      : peer{create_peer(factory, this)}, signal_socket{signal_socket} {
+    signal_socket->set_message_handler(
+        [this](websocketpp::connection_hdl hdl,
+               server_type::message_ptr message) { on_message(hdl, message); });
+  }
+
+  template <typename... types>
+  static auto make(types&&... args) {
+    return rtc::make_ref_counted<webrtc_observer>(std::forward<types>(args)...);
+  }
+
+  void close() { peer->Close(); }
+
+ private:
+  rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer;
+  server_type::connection_ptr signal_socket;
+
+  static rtc::scoped_refptr<webrtc::PeerConnectionInterface> create_peer(
+      webrtc::PeerConnectionFactoryInterface* factory,
+      webrtc_observer* host) {
+    webrtc::PeerConnectionInterface::RTCConfiguration config{};
+    config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
+    webrtc::PeerConnectionInterface::IceServer turner{};
+    turner.uri = "turn:54.200.166.206:3478?transport=tcp";
+    turner.username = "user";
+    turner.password = "root";
+    config.servers.emplace_back(std::move(turner));
+
+    const auto maybe_pc = factory->CreatePeerConnectionOrError(
+        config, webrtc::PeerConnectionDependencies{host});
+
+    if (!maybe_pc.ok()) {
+      throw std::runtime_error{"failed to create PeerConnection"};
+    }
+
+    log(level::info, "created PeerConnection\n");
+
+    return std::move(maybe_pc.value());
+  }
+
+  void on_message(websocketpp::connection_hdl hdl,
+                  server_type::message_ptr message) {
+    // TODO: we really should check that it's the expected hdl here
+    const auto opcode = message->get_opcode();
+    if (opcode != 1) {
+      log(level::warning, reinterpret_cast<std::uintptr_t>(this),
+          "I don't know how to use this frame", opcode);
+
+      return;
+    }
+
+    auto payload = boost::json::parse(message->get_payload()).as_object();
+    if (payload.contains("offer")) {
+      auto offer = payload["offer"].as_object();
+      peer->SetRemoteDescription(
+          this, webrtc::CreateSessionDescription(
+                    webrtc::SdpTypeFromString(offer["type"].as_string().c_str())
+                        .value(),
+                    offer["sdp"].as_string().c_str())
+                    .release());
+
+      peer->CreateAnswer(
+          this, webrtc::PeerConnectionInterface::RTCOfferAnswerOptions{});
+    } else if (payload.contains("new-ice-candidate")) {
+      auto blob = payload["new-ice-candidate"].as_object();
+      webrtc::SdpParseError error{};
+      std::unique_ptr<webrtc::IceCandidateInterface> candidate{
+          webrtc::CreateIceCandidate(blob["sdpMid"].as_string().c_str(),
+                                     blob["sdpMLineIndex"].as_int64(),
+                                     blob["candidate"].as_string().c_str(),
+                                     &error)};
+
+      if (!candidate) {
+        log(level::error, reinterpret_cast<std::uintptr_t>(this),
+            "failed to parse ICE candidate: ", error.description);
+        return;
+      }
+
+      peer->AddIceCandidate(
+          std::move(candidate), [this](webrtc::RTCError error) {
+            if (!error.ok())
+              log(level::error, reinterpret_cast<std::uintptr_t>(this),
+                  "failed to set ICE candidate with error:", error.message());
+          });
+    }
+  }
+
+  void OnSignalingChange(
+      webrtc::PeerConnectionInterface::SignalingState new_state) override {
+    const auto name = [new_state] {
+      switch (new_state) {
+        case decltype(new_state)::kStable:
+          return "kStable";
+
+        case decltype(new_state)::kHaveLocalOffer:
+          return "kHaveLocalOffer";
+
+        case decltype(new_state)::kHaveLocalPrAnswer:
+          return "kHaveLocalPrAnswer";
+
+        case decltype(new_state)::kHaveRemoteOffer:
+          return "kHaveRemoteOffer";
+
+        case decltype(new_state)::kHaveRemotePrAnswer:
+          return "kHaveRemotePrAnswer";
+
+        case decltype(new_state)::kClosed:
+          return "kClosed";
+      }
+    }();
+
+    log(level::info, reinterpret_cast<std::uintptr_t>(this),
+        "Signaling state change:", name);
+  }
+
+  void OnDataChannel(
+      rtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) override {
+    log(level::info, reinterpret_cast<std::uintptr_t>(this),
+        "Added data channel to peer");
+  }
+
+  void OnIceGatheringChange(
+      webrtc::PeerConnectionInterface::IceGatheringState state) override {
+    log(level::info, reinterpret_cast<std::uintptr_t>(this),
+        "ICE gathering state change:", [state] {
+          switch (state) {
+            case decltype(state)::kIceGatheringComplete:
+              return "Complete";
+
+            case decltype(state)::kIceGatheringGathering:
+              return "Gathering";
+
+            case decltype(state)::kIceGatheringNew:
+              return "New";
+          }
+        }());
+  }
+
+  void OnIceCandidate(const webrtc::IceCandidateInterface* candidate) override {
+    std::string blob{};
+    if (!candidate->ToString(&blob)) {
+      log(level::error, reinterpret_cast<std::uintptr_t>(this),
+          "failed to serialize ICE candidate");
+      return;
+    }
+
+    boost::json::object data{};
+    boost::json::object inner_blob{};
+    inner_blob["candidate"] = blob;
+    inner_blob["sdpMid"] = candidate->sdp_mid();
+    inner_blob["sdpMLineIndex"] = candidate->sdp_mline_index();
+    data["iceCandidate"] = inner_blob;
+    signal_socket->send(boost::json::serialize(data),
+                        websocketpp::frame::opcode::text);
+  }
+
+  void OnSuccess(webrtc::SessionDescriptionInterface* desc) override {
+    log(level::info, reinterpret_cast<std::uintptr_t>(this),
+        "created local session description");
+    peer->SetLocalDescription(this, desc);
+    boost::json::object data{};
+    data["type"] = webrtc::SdpTypeToString(desc->GetType());
+    std::string sdp{};
+    if (!desc->ToString(&sdp)) {
+      log(level::error, reinterpret_cast<std::uintptr_t>(this),
+          "failed to serialize SDP");
+
+      return;
+    }
+
+    data["sdp"] = sdp;
+    boost::json::object msg{};
+    msg["answer"] = data;
+    signal_socket->send(boost::json::serialize(msg),
+                        websocketpp::frame::opcode::text);
+  }
+
+  void OnSuccess() override {
+    log(level::info, reinterpret_cast<std::uintptr_t>(this),
+        "SetSessionDescription succeeded");
+  }
+
+  void OnFailure(webrtc::RTCError error) override {
+    log(level::error, reinterpret_cast<std::uintptr_t>(this),
+        "SetSessionDescription/CreateSessionDescription failed:",
+        error.message());
+  }
+};
+
 class source_server : public socket_server<source_server> {
  public:
+  source_server(
+      rtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory)
+      : socket_server<source_server>{},
+        connection{},
+        factory{factory},
+        peer{} {}
+
   template <typename... types>
   void on_open(websocketpp::connection_hdl hdl, types&&...) {
     const auto new_connection = server.get_con_from_hdl(hdl);
@@ -142,12 +344,14 @@ class source_server : public socket_server<source_server> {
     }
 
     connection = new_connection;
+    peer = webrtc_observer::make(factory.get(), connection);
   }
 
   void on_close(websocketpp::connection_hdl hdl) {
     const auto new_connection = server.get_con_from_hdl(hdl);
     if (connection == new_connection) {
       log(level::warning, "source disconnected");
+      close_peer();
       connection = nullptr;
     }
   }
@@ -158,13 +362,24 @@ class source_server : public socket_server<source_server> {
   void close_all() {
     if (connection) {
       log(level::info, "closing source connection");
+      close_peer();
       connection->close(websocketpp::close::status::going_away,
                         "Server shutting down");
     }
   }
 
  private:
-  decltype(server)::connection_ptr connection{};
+  decltype(server)::connection_ptr connection;
+  rtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
+  rtc::scoped_refptr<rtc::FinalRefCountedObject<webrtc_observer>> peer;
+
+  void close_peer() {
+    if (!peer)
+      return;
+
+    peer->close();
+    peer = nullptr;
+  }
 };
 
 class sink_server : public socket_server<sink_server> {
@@ -219,12 +434,12 @@ int main() {
 
   try {
     rtc::LogMessage::LogToDebug(rtc::LS_ERROR);
-    source_server source{};
+    webrtc_factory factory{};
+    source_server source{factory.factory};
+    webrtc_factory factory1{};
     sink_server sink{};
     scoped_session source_session{source, 9002};
     scoped_session sink_session{sink, 9003};
-    webrtc_factory factory{};
-    webrtc_factory factory1{};
 
     std::string input{};
     while (std::cin >> input) {
@@ -232,7 +447,7 @@ int main() {
         break;
     }
   } catch (const std::exception& error) {
-    log(level::error, error.what());
+    log(level::error, "fatal error: ", error.what());
     return -1;
   }
 }
