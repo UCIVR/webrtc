@@ -106,7 +106,7 @@ class socket_server {
 
   void shut_down() {
     server.stop_listening();
-    //self().close_all();
+    // self().close_all();
     server.stop();
     server_thread.join();
   }
@@ -131,12 +131,19 @@ class socket_server {
   void close_all() {}
 };
 
+using track_callback =
+    std::function<void(rtc::scoped_refptr<webrtc::RtpTransceiverInterface>)>;
+
 class webrtc_observer : public webrtc::PeerConnectionObserver,
                         public webrtc::CreateSessionDescriptionObserver,
                         public webrtc::SetSessionDescriptionObserver {
  public:
-  webrtc_observer(server_type::connection_ptr signal_socket)
-      : factory{}, peer{create_peer(this)}, signal_socket{signal_socket} {
+  webrtc_observer(server_type::connection_ptr signal_socket,
+                  track_callback on_track)
+      : factory{},
+        peer{create_peer(this)},
+        signal_socket{signal_socket},
+        on_track{on_track} {
     signal_socket->set_message_handler(
         [this](websocketpp::connection_hdl hdl,
                server_type::message_ptr message) { on_message(hdl, message); });
@@ -153,8 +160,12 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
   webrtc_factory factory;
   rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer;
   server_type::connection_ptr signal_socket;
+  track_callback on_track;
 
-  void close() { peer->Close(); }
+  void close() {
+    peer->Close();
+    log(level::info, reinterpret_cast<std::uintptr_t>(this), "closing peer");
+  }
 
   static rtc::scoped_refptr<webrtc::PeerConnectionInterface> create_peer(
       webrtc_observer* host) {
@@ -258,6 +269,10 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
       rtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) override {
     log(level::info, reinterpret_cast<std::uintptr_t>(this),
         "Added data channel to peer");
+
+    // TODO: remove me
+    webrtc::DataChannelInit channel{};
+    peer->CreateDataChannel("I Am a Teapot", &channel);
   }
 
   void OnIceGatheringChange(
@@ -326,6 +341,11 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
         "SetSessionDescription/CreateSessionDescription failed:",
         error.message());
   }
+
+  void OnTrack(
+      rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
+    on_track(transceiver);
+  }
 };
 
 using peer_ptr =
@@ -344,7 +364,11 @@ class source_server : public socket_server<source_server> {
     }
 
     connection = new_connection;
-    peer = webrtc_observer::make(connection);
+    peer = webrtc_observer::make(
+        connection,
+        [this](rtc::scoped_refptr<webrtc::RtpTransceiverInterface> track) {
+          on_track(track);
+        });
   }
 
   void on_close(websocketpp::connection_hdl hdl) {
@@ -358,6 +382,15 @@ class source_server : public socket_server<source_server> {
 
   template <typename... types>
   void on_message(types&&...) {}
+
+  void on_track(rtc::scoped_refptr<webrtc::RtpTransceiverInterface> track) {
+    log(level::info, "track added",
+        reinterpret_cast<std::uintptr_t>(track.get()));
+
+    if (track->receiver()->track()->enabled())
+      log(level::info, "track enabled",
+          reinterpret_cast<std::uintptr_t>(track.get()));
+  }
 
   void close_all() {
     if (connection) {
@@ -381,7 +414,8 @@ class sink_server : public socket_server<sink_server> {
     const auto new_connection = server.get_con_from_hdl(hdl);
     const auto maybe = connections.find(new_connection);
     if (maybe == connections.end())
-      connections[new_connection] = webrtc_observer::make(new_connection);
+      connections[new_connection] =
+          webrtc_observer::make(new_connection, [](auto&&...) {});
   }
 
   void on_close(websocketpp::connection_hdl hdl) {
