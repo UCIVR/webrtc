@@ -58,12 +58,11 @@ void log(level severity, types&&... args) {
 }
 
 struct webrtc_factory {
-  std::unique_ptr<rtc::Thread> signal_thread{};
+  const static std::unique_ptr<rtc::Thread> signal_thread;
+
   rtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory{};
 
-  webrtc_factory()
-      : signal_thread{rtc::Thread::CreateWithSocketServer()}, factory{} {
-    signal_thread->Start();
+  webrtc_factory() : factory{} {
     factory = webrtc::CreatePeerConnectionFactory(
         nullptr, nullptr, signal_thread.get(), nullptr,
         webrtc::CreateBuiltinAudioEncoderFactory(),
@@ -77,6 +76,12 @@ struct webrtc_factory {
 
   auto operator->() { return factory.operator->(); }
 };
+
+const std::unique_ptr<rtc::Thread> webrtc_factory::signal_thread{[] {
+  auto thread = rtc::Thread::CreateWithSocketServer();
+  thread->Start();
+  return thread;
+}()};
 
 template <typename derived>
 class socket_server {
@@ -134,16 +139,21 @@ class socket_server {
 using track_callback =
     std::function<void(rtc::scoped_refptr<webrtc::RtpTransceiverInterface>)>;
 
+// TODO: stop the relayed stream before destruction completes, to avoid a racy segfault
+// TODO: implement renegotiation so the source can be switched out?
 class webrtc_observer : public webrtc::PeerConnectionObserver,
                         public webrtc::CreateSessionDescriptionObserver,
                         public webrtc::SetSessionDescriptionObserver {
  public:
   webrtc_observer(server_type::connection_ptr signal_socket,
-                  track_callback on_track)
+                  track_callback on_track,
+                  rtc::scoped_refptr<webrtc::RtpTransceiverInterface> track)
       : factory{},
-        peer{create_peer(this)},
+        peer{},
         signal_socket{signal_socket},
-        on_track{on_track} {
+        on_track{on_track},
+        senders{} {
+    peer = create_peer(this, track);
     signal_socket->set_message_handler(
         [this](websocketpp::connection_hdl hdl,
                server_type::message_ptr message) { on_message(hdl, message); });
@@ -154,18 +164,6 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
   template <typename... types>
   static auto make(types&&... args) {
     return rtc::make_ref_counted<webrtc_observer>(std::forward<types>(args)...);
-  }
-
-  void add_track(rtc::scoped_refptr<webrtc::RtpTransceiverInterface> track) {
-    const auto sender =
-        peer->AddTrack(track->receiver()->track(), {"mirrored_stream"});
-
-    if (!sender.ok()) {
-      log(level::error, "failed to add track:", sender.error().message());
-      return;
-    }
-
-    senders.emplace_back(sender.value());
   }
 
  private:
@@ -181,8 +179,8 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
   }
 
   static rtc::scoped_refptr<webrtc::PeerConnectionInterface> create_peer(
-      webrtc_observer* host) {
-    const auto& [signal_thread, factory] = host->factory;
+      webrtc_observer* host,
+      rtc::scoped_refptr<webrtc::RtpTransceiverInterface> track) {
     webrtc::PeerConnectionInterface::RTCConfiguration config{};
     config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
     webrtc::PeerConnectionInterface::IceServer turner{};
@@ -191,7 +189,7 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
     turner.password = "root";
     config.servers.emplace_back(std::move(turner));
 
-    const auto maybe_pc = factory->CreatePeerConnectionOrError(
+    const auto maybe_pc = host->factory->CreatePeerConnectionOrError(
         config, webrtc::PeerConnectionDependencies{host});
 
     if (!maybe_pc.ok()) {
@@ -200,7 +198,19 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
 
     log(level::info, "created PeerConnection\n");
 
-    return std::move(maybe_pc.value());
+    auto peer = maybe_pc.value();
+    if (track) {
+      const auto real_track = track->receiver()->track();
+      const auto sender = peer->AddTrack(real_track, {"mirrored_stream"});
+      if (!sender.ok()) {
+        log(level::error, "failed to add track:", sender.error().message());
+      } else {
+        log(level::info, "added track to peer");
+        host->senders.emplace_back(sender.value());
+      }
+    }
+
+    return std::move(peer);
   }
 
   void on_message(websocketpp::connection_hdl hdl,
@@ -370,9 +380,11 @@ class sink_server : public socket_server<sink_server> {
   void on_open(websocketpp::connection_hdl hdl, types&&...) {
     const auto new_connection = server.get_con_from_hdl(hdl);
     const auto maybe = connections.find(new_connection);
-    if (maybe == connections.end())
-      connections[new_connection] =
-          webrtc_observer::make(new_connection, [](auto&&...) {});
+    if (maybe == connections.end()) {
+      const auto peer = webrtc_observer::make(
+          new_connection, [](auto&&...) {}, transceiver);
+      connections[new_connection] = peer;
+    }
   }
 
   void on_close(websocketpp::connection_hdl hdl) {
@@ -401,8 +413,20 @@ class sink_server : public socket_server<sink_server> {
     connections.clear();
   }
 
+  void switch_source(
+      rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
+    log(level::info, "switching sources");
+    this->transceiver = transceiver;
+    // TODO: OnNegotiationNeeded?
+    // for (const auto& [conn, peer] : connections)
+    //   peer->add_track(transceiver);
+  }
+
  private:
   std::map<decltype(server)::connection_ptr, peer_ptr> connections{};
+
+  std::mutex track_lock;
+  rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver;
 };
 
 class source_server : public socket_server<source_server> {
@@ -423,7 +447,8 @@ class source_server : public socket_server<source_server> {
         connection,
         [this](rtc::scoped_refptr<webrtc::RtpTransceiverInterface> track) {
           on_track(track);
-        });
+        },
+        nullptr);
   }
 
   void on_close(websocketpp::connection_hdl hdl) {
@@ -446,7 +471,7 @@ class source_server : public socket_server<source_server> {
       log(level::info, "track enabled",
           reinterpret_cast<std::uintptr_t>(track.get()));
 
-    peer->add_track(track);
+    sink.switch_source(track);
   }
 
   void close_all() {
