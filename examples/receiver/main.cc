@@ -40,18 +40,21 @@ constexpr auto name(level l) {
   }
 }
 
-template <typename... types>
-std::mutex log_lock {};
+std::mutex log_lock{};
+std::ofstream log_file{"relay.log"};
 
+template <typename... types>
 void log_to(std::ostream& stream, level severity, types&&... args) {
-  std::cout << "[relay:" << name(severity) << "]";
-  ((std::cout << ' ' << std::forward<types>(args)), ...);
-  std::cout << std::endl;
+  stream << "[relay:" << name(severity) << "]";
+  ((stream << ' ' << std::forward<types>(args)), ...);
+  stream << std::endl;
 }
 
+template <typename... types>
 void log(level severity, types&&... args) {
   std::lock_guard guard{log_lock};
-  log_to(std::cout, severity, std::forward<types>(args)...)  
+  log_to(std::cerr, severity, std::forward<types>(args)...);
+  log_to(log_file, severity, std::forward<types>(args)...);
 }
 
 struct webrtc_factory {
@@ -71,6 +74,8 @@ struct webrtc_factory {
     if (!factory)
       throw std::runtime_error{"Failed to create PeerConnectionFactory"};
   }
+
+  auto operator->() { return factory.operator->(); }
 };
 
 template <typename derived>
