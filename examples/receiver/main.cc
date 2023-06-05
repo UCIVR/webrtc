@@ -135,9 +135,8 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
                         public webrtc::CreateSessionDescriptionObserver,
                         public webrtc::SetSessionDescriptionObserver {
  public:
-  webrtc_observer(webrtc::PeerConnectionFactoryInterface* factory,
-                  server_type::connection_ptr signal_socket)
-      : peer{create_peer(factory, this)}, signal_socket{signal_socket} {
+  webrtc_observer(server_type::connection_ptr signal_socket)
+      : peer{create_peer(this)}, signal_socket{signal_socket} {
     signal_socket->set_message_handler(
         [this](websocketpp::connection_hdl hdl,
                server_type::message_ptr message) { on_message(hdl, message); });
@@ -155,8 +154,8 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
   server_type::connection_ptr signal_socket;
 
   static rtc::scoped_refptr<webrtc::PeerConnectionInterface> create_peer(
-      webrtc::PeerConnectionFactoryInterface* factory,
       webrtc_observer* host) {
+    const auto& [signal_thread, factory] = webrtc_factory{};
     webrtc::PeerConnectionInterface::RTCConfiguration config{};
     config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
     webrtc::PeerConnectionInterface::IceServer turner{};
@@ -328,12 +327,7 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
 
 class source_server : public socket_server<source_server> {
  public:
-  source_server(
-      rtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory)
-      : socket_server<source_server>{},
-        connection{},
-        factory{factory},
-        peer{} {}
+  source_server() : socket_server<source_server>{}, connection{}, peer{} {}
 
   template <typename... types>
   void on_open(websocketpp::connection_hdl hdl, types&&...) {
@@ -370,7 +364,6 @@ class source_server : public socket_server<source_server> {
 
  private:
   decltype(server)::connection_ptr connection;
-  rtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
   rtc::scoped_refptr<rtc::FinalRefCountedObject<webrtc_observer>> peer;
 
   void close_peer() {
@@ -434,9 +427,7 @@ int main() {
 
   try {
     rtc::LogMessage::LogToDebug(rtc::LS_ERROR);
-    webrtc_factory factory{};
-    source_server source{factory.factory};
-    webrtc_factory factory1{};
+    source_server source{};
     sink_server sink{};
     scoped_session source_session{source, 9002};
     scoped_session sink_session{sink, 9003};
