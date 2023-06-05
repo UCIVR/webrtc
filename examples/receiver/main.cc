@@ -2,6 +2,7 @@
 #include <api/peer_connection_interface.h>
 #include <rtc_base/thread.h>
 
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <mutex>
@@ -46,11 +47,24 @@ void log(level severity, types&&... args) {
   std::cout << std::endl;
 }
 
-auto configure_server(unsigned port) {
-  server_type server{};
+struct webrtc_factory {
+  std::unique_ptr<rtc::Thread> signal_thread{};
+  rtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory{};
 
-  return server;
-}
+  webrtc_factory()
+      : signal_thread{rtc::Thread::CreateWithSocketServer()}, factory{} {
+    signal_thread->Start();
+    factory = webrtc::CreatePeerConnectionFactory(
+        nullptr, nullptr, signal_thread.get(), nullptr,
+        webrtc::CreateBuiltinAudioEncoderFactory(),
+        webrtc::CreateBuiltinAudioDecoderFactory(),
+        webrtc::CreateBuiltinVideoEncoderFactory(),
+        webrtc::CreateBuiltinVideoDecoderFactory(), nullptr, nullptr);
+
+    if (!factory)
+      throw std::runtime_error{"Failed to create PeerConnectionFactory"};
+  }
+};
 
 template <typename derived>
 class socket_server {
@@ -173,22 +187,40 @@ class sink_server : public socket_server<sink_server> {
  private:
   std::set<decltype(server)::connection_ptr> connections{};
 };
+
+template <typename type>
+class scoped_session {
+ public:
+  scoped_session(type& server, unsigned port) : server{server} {
+    server.start(port);
+  }
+
+  ~scoped_session() { server.shut_down(); }
+
+ private:
+  type& server;
+};
 }  // namespace receiver
 
 int main() {
   using namespace receiver;
 
-  source_server source{};
-  sink_server sink{};
-  source.start(9002);
-  sink.start(9003);
+  try {
+    rtc::LogMessage::LogToDebug(rtc::LS_ERROR);
+    source_server source{};
+    sink_server sink{};
+    scoped_session source_session{source, 9002};
+    scoped_session sink_session{sink, 9003};
+    webrtc_factory factory{};
+    webrtc_factory factory1{};
 
-  std::string input{};
-  while (std::cin >> input) {
-    if (input == "exit")
-      break;
+    std::string input{};
+    while (std::cin >> input) {
+      if (input == "exit")
+        break;
+    }
+  } catch (const std::exception& error) {
+    log(level::error, error.what());
+    return -1;
   }
-
-  source.shut_down();
-  sink.shut_down();
 }
