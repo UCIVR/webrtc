@@ -156,11 +156,24 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
     return rtc::make_ref_counted<webrtc_observer>(std::forward<types>(args)...);
   }
 
+  void add_track(rtc::scoped_refptr<webrtc::RtpTransceiverInterface> track) {
+    const auto sender =
+        peer->AddTrack(track->receiver()->track(), {"mirrored_stream"});
+
+    if (!sender.ok()) {
+      log(level::error, "failed to add track:", sender.error().message());
+      return;
+    }
+
+    senders.emplace_back(sender.value());
+  }
+
  private:
   webrtc_factory factory;
   rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer;
   server_type::connection_ptr signal_socket;
   track_callback on_track;
+  std::vector<rtc::scoped_refptr<webrtc::RtpSenderInterface>> senders{};
 
   void close() {
     peer->Close();
@@ -351,62 +364,6 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
 using peer_ptr =
     rtc::scoped_refptr<rtc::FinalRefCountedObject<webrtc_observer>>;
 
-class source_server : public socket_server<source_server> {
- public:
-  source_server() : socket_server<source_server>{}, connection{}, peer{} {}
-
-  template <typename... types>
-  void on_open(websocketpp::connection_hdl hdl, types&&...) {
-    const auto new_connection = server.get_con_from_hdl(hdl);
-    if (connection) {
-      log(level::warning, "rejecting sink connection; one already exists");
-      return;
-    }
-
-    connection = new_connection;
-    peer = webrtc_observer::make(
-        connection,
-        [this](rtc::scoped_refptr<webrtc::RtpTransceiverInterface> track) {
-          on_track(track);
-        });
-  }
-
-  void on_close(websocketpp::connection_hdl hdl) {
-    const auto new_connection = server.get_con_from_hdl(hdl);
-    if (connection == new_connection) {
-      log(level::warning, "source disconnected");
-      connection = nullptr;
-      peer = nullptr;
-    }
-  }
-
-  template <typename... types>
-  void on_message(types&&...) {}
-
-  void on_track(rtc::scoped_refptr<webrtc::RtpTransceiverInterface> track) {
-    log(level::info, "track added",
-        reinterpret_cast<std::uintptr_t>(track.get()));
-
-    if (track->receiver()->track()->enabled())
-      log(level::info, "track enabled",
-          reinterpret_cast<std::uintptr_t>(track.get()));
-  }
-
-  void close_all() {
-    if (connection) {
-      log(level::info, "closing source connection");
-      connection->close(websocketpp::close::status::going_away,
-                        "Server shutting down");
-
-      peer = nullptr;
-    }
-  }
-
- private:
-  decltype(server)::connection_ptr connection;
-  peer_ptr peer;
-};
-
 class sink_server : public socket_server<sink_server> {
  public:
   template <typename... types>
@@ -448,6 +405,66 @@ class sink_server : public socket_server<sink_server> {
   std::map<decltype(server)::connection_ptr, peer_ptr> connections{};
 };
 
+class source_server : public socket_server<source_server> {
+ public:
+  source_server(sink_server& sink)
+      : socket_server<source_server>{}, sink{sink}, connection{}, peer{} {}
+
+  template <typename... types>
+  void on_open(websocketpp::connection_hdl hdl, types&&...) {
+    const auto new_connection = server.get_con_from_hdl(hdl);
+    if (connection) {
+      log(level::warning, "rejecting sink connection; one already exists");
+      return;
+    }
+
+    connection = new_connection;
+    peer = webrtc_observer::make(
+        connection,
+        [this](rtc::scoped_refptr<webrtc::RtpTransceiverInterface> track) {
+          on_track(track);
+        });
+  }
+
+  void on_close(websocketpp::connection_hdl hdl) {
+    const auto new_connection = server.get_con_from_hdl(hdl);
+    if (connection == new_connection) {
+      log(level::warning, "source disconnected");
+      connection = nullptr;
+      peer = nullptr;
+    }
+  }
+
+  template <typename... types>
+  void on_message(types&&...) {}
+
+  void on_track(rtc::scoped_refptr<webrtc::RtpTransceiverInterface> track) {
+    log(level::info, "track added",
+        reinterpret_cast<std::uintptr_t>(track.get()));
+
+    if (track->receiver()->track()->enabled())
+      log(level::info, "track enabled",
+          reinterpret_cast<std::uintptr_t>(track.get()));
+
+    peer->add_track(track);
+  }
+
+  void close_all() {
+    if (connection) {
+      log(level::info, "closing source connection");
+      connection->close(websocketpp::close::status::going_away,
+                        "Server shutting down");
+
+      peer = nullptr;
+    }
+  }
+
+ private:
+  sink_server& sink;
+  decltype(server)::connection_ptr connection;
+  peer_ptr peer;
+};
+
 template <typename type>
 class scoped_session {
  public:
@@ -467,8 +484,8 @@ int main() {
 
   try {
     rtc::LogMessage::LogToDebug(rtc::LS_ERROR);
-    source_server source{};
     sink_server sink{};
+    source_server source{sink};
     scoped_session source_session{source, 9002};
     scoped_session sink_session{sink, 9003};
 
