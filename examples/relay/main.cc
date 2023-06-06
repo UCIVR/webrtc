@@ -228,9 +228,10 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
       return;
     }
 
+    log(level::info, "received:", message->get_payload());
     auto payload = boost::json::parse(message->get_payload()).as_object();
-    if (payload.contains("offer")) {
-      auto offer = payload["offer"].as_object();
+    if (payload.contains("description")) {
+      auto offer = payload["description"].as_object();
       peer->SetRemoteDescription(
           this, webrtc::CreateSessionDescription(
                     webrtc::SdpTypeFromString(offer["type"].as_string().c_str())
@@ -240,8 +241,8 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
 
       peer->CreateAnswer(
           this, webrtc::PeerConnectionInterface::RTCOfferAnswerOptions{});
-    } else if (payload.contains("new-ice-candidate")) {
-      auto blob = payload["new-ice-candidate"].as_object();
+    } else if (payload.contains("candidate")) {
+      auto blob = payload["candidate"].as_object();
       webrtc::SdpParseError error{};
       std::unique_ptr<webrtc::IceCandidateInterface> candidate{
           webrtc::CreateIceCandidate(blob["sdpMid"].as_string().c_str(),
@@ -328,7 +329,7 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
     inner_blob["candidate"] = blob;
     inner_blob["sdpMid"] = candidate->sdp_mid();
     inner_blob["sdpMLineIndex"] = candidate->sdp_mline_index();
-    data["iceCandidate"] = inner_blob;
+    data["candidate"] = inner_blob;
     signal_socket->send(boost::json::serialize(data),
                         websocketpp::frame::opcode::text);
   }
@@ -349,7 +350,7 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
 
     data["sdp"] = sdp;
     boost::json::object msg{};
-    msg["answer"] = data;
+    msg["description"] = data;
     signal_socket->send(boost::json::serialize(msg),
                         websocketpp::frame::opcode::text);
   }

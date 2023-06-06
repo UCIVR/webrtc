@@ -47,7 +47,84 @@ async function makeCall() {
         ]
     };
 
+    const send = obj => socket.send(JSON.stringify(obj));
     const peerConnection = new RTCPeerConnection(configuration);
+
+    peerConnection.ontrack = event => alert("TRACK");
+    peerConnection.ondatachannel = event => alert("CHANNEL");
+    peerConnection.onconnectionstatechange = event => {
+        console.log(peerConnection.connectionState);
+        if (peerConnection.connectionState == "disconnected") {
+            socket.close();
+            socket = null;
+            enable();
+            peerConnection.close();
+            if (stream != null) {
+                stream.getTracks().forEach(track => { track.stop(); });
+            }
+        }
+    };
+
+    let makingOffer = false;
+    peerConnection.onnegotiationneeded = async () => {
+        try {
+            makingOffer = true;
+            await peerConnection.setLocalDescription();
+            send({ description: peerConnection.localDescription });
+        } catch (err) {
+            console.error(err);
+        } finally {
+            makingOffer = false;
+        }
+    };
+
+    let ignoreOffer = false;
+    const polite = true;
+    socket.onmessage = async message => {
+        message = JSON.parse(message.data);
+        let inner = async ({ description, candidate }) => {
+            try {
+                if (description) {
+                    const offerCollision =
+                        description.type === "offer" &&
+                        (makingOffer || peerConnection.signalingState !== "stable");
+
+                    ignoreOffer = !polite && offerCollision;
+                    if (ignoreOffer) {
+                        return;
+                    }
+
+                    await peerConnection.setRemoteDescription(description);
+                    if (description.type === "offer") {
+                        await peerConnection.setLocalDescription();
+                        send({ description: peerConnection.localDescription });
+                    }
+                } else if (candidate) {
+                    try {
+                        await peerConnection.addIceCandidate(candidate);
+                    } catch (err) {
+                        if (!ignoreOffer) {
+                            throw err;
+                        }
+                    }
+                }
+            } catch (err) {
+                console.error(err);
+            }
+        };
+
+        await inner(message);
+    };
+
+    peerConnection.onicecandidate = ({ candidate }) => { if (candidate) send({ candidate }); };
+
+    peerConnection.onicegatheringstatechange = _ => {
+        console.log("[ICE] " + peerConnection.iceGatheringState);
+    }
+
+    peerConnection.oniceconnectionstatechange = _ => {
+        console.log("[ICE Connection] " + peerConnection.iceConnectionState);
+    }
 
     let stream = null;
     if (document.getElementById("port").value == "9002") {
@@ -65,57 +142,5 @@ async function makeCall() {
         console.log("Adding data channel");
         peerConnection.addTransceiver("video", { direction: "recvonly" })
         peerConnection.createDataChannel("dummyChannel");
-    }
-
-    peerConnection.ontrack = event => alert("TRACK");
-    peerConnection.ondatachannel = event => alert("CHANNEL");
-    peerConnection.onconnectionstatechange = event => {
-        console.log(peerConnection.connectionState);
-        if (peerConnection.connectionState == "disconnected") {
-            socket.close();
-            socket = null;
-            enable();
-            peerConnection.close();
-            if (stream != null) {
-                stream.getTracks().forEach(track => { track.stop(); });
-            }
-        }
-    };
-
-    socket.onmessage = async message => {
-        message = JSON.parse(message.data)
-        console.log(message);
-        if (message.answer) {
-            const remoteDesc = new RTCSessionDescription(message.answer);
-            await peerConnection.setRemoteDescription(remoteDesc);
-            console.log("set remote description")
-        } else if (message.iceCandidate) {
-            try {
-                await peerConnection.addIceCandidate(message.iceCandidate);
-                console.log("added candidate");
-            } catch (e) {
-                console.error('Error adding received ice candidate', e);
-            }
-        } else {
-            console.warn(message);
-        }
-    };
-
-    const offer = await peerConnection.createOffer();
-    await peerConnection.setLocalDescription(offer);
-    socket.send(JSON.stringify({ 'offer': offer }));
-
-    peerConnection.onicecandidate = event => {
-        if (event.candidate) {
-            socket.send(JSON.stringify({ 'new-ice-candidate': event.candidate }));
-        }
-    };
-
-    peerConnection.onicegatheringstatechange = _ => {
-        console.log("[ICE] " + peerConnection.iceGatheringState);
-    }
-
-    peerConnection.oniceconnectionstatechange = _ => {
-        console.log("[ICE Connection] " + peerConnection.iceConnectionState);
     }
 }
