@@ -50,7 +50,7 @@ group("examples") {
   if (is_linux || is_chromeos || is_win) {
     deps += [
       ":peerconnection_server",
-      ":receiver",
+      ":relay",
       ":stunserver",
       ":turnserver",
     ]
@@ -822,9 +822,9 @@ if (is_linux || is_chromeos || is_win) {
     ]
   }
 
-  rtc_executable("receiver") {
+  rtc_executable("relay") {
     testonly = true
-    sources = [ "receiver/main.cc" ]
+    sources = [ "relay/main.cc" ]
     configs += [ "../build/config/compiler:exceptions" ]
     deps = [
       "../api:create_peerconnection_factory",
@@ -839,7 +839,7 @@ if (is_linux || is_chromeos || is_win) {
       "../rtc_base:threading"
     ]
 
-    include_dirs = [ "receiver/websocketpp", "C:/boost_1_82_0", "../../../boost_1_82_0" ]
+    include_dirs = [ "relay/websocketpp", "C:/boost_1_82_0", "../../../boost_1_82_0" ]
     lib_dirs = [ "C:/boost_1_82_0/lib64-msvc-14.3" ]
   }
 
