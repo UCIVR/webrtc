@@ -58,11 +58,12 @@ void log(level severity, types&&... args) {
 }
 
 struct webrtc_factory {
-  const static std::unique_ptr<rtc::Thread> signal_thread;
-
+  std::unique_ptr<rtc::Thread> signal_thread;
   rtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory{};
 
-  webrtc_factory() : factory{} {
+  webrtc_factory()
+      : signal_thread{rtc::Thread::CreateWithSocketServer()}, factory{} {
+    signal_thread->Start();
     factory = webrtc::CreatePeerConnectionFactory(
         nullptr, nullptr, signal_thread.get(), nullptr,
         webrtc::CreateBuiltinAudioEncoderFactory(),
@@ -76,12 +77,6 @@ struct webrtc_factory {
 
   auto operator->() { return factory.operator->(); }
 };
-
-const std::unique_ptr<rtc::Thread> webrtc_factory::signal_thread{[] {
-  auto thread = rtc::Thread::CreateWithSocketServer();
-  thread->Start();
-  return thread;
-}()};
 
 template <typename derived>
 class socket_server {
@@ -139,16 +134,18 @@ class socket_server {
 using track_callback =
     std::function<void(rtc::scoped_refptr<webrtc::RtpTransceiverInterface>)>;
 
-// TODO: stop the relayed stream before destruction completes, to avoid a racy segfault
+// TODO: stop the relayed stream before destruction completes, to avoid a racy
+// segfault
 // TODO: implement renegotiation so the source can be switched out?
 class webrtc_observer : public webrtc::PeerConnectionObserver,
                         public webrtc::CreateSessionDescriptionObserver,
                         public webrtc::SetSessionDescriptionObserver {
  public:
-  webrtc_observer(server_type::connection_ptr signal_socket,
+  webrtc_observer(webrtc_factory& factory,
+                  server_type::connection_ptr signal_socket,
                   track_callback on_track,
                   rtc::scoped_refptr<webrtc::RtpTransceiverInterface> track)
-      : factory{},
+      : factory{factory},
         peer{},
         signal_socket{signal_socket},
         on_track{on_track},
@@ -167,7 +164,7 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
   }
 
  private:
-  webrtc_factory factory;
+  webrtc_factory& factory;
   rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer;
   server_type::connection_ptr signal_socket;
   track_callback on_track;
@@ -376,13 +373,20 @@ using peer_ptr =
 
 class sink_server : public socket_server<sink_server> {
  public:
+  sink_server(webrtc_factory& factory)
+      : socket_server{},
+        factory{factory},
+        connections{},
+        track_lock{},
+        transceiver{} {}
+
   template <typename... types>
   void on_open(websocketpp::connection_hdl hdl, types&&...) {
     const auto new_connection = server.get_con_from_hdl(hdl);
     const auto maybe = connections.find(new_connection);
     if (maybe == connections.end()) {
       const auto peer = webrtc_observer::make(
-          new_connection, [](auto&&...) {}, transceiver);
+          factory, new_connection, [](auto&&...) {}, transceiver);
       connections[new_connection] = peer;
     }
   }
@@ -423,16 +427,17 @@ class sink_server : public socket_server<sink_server> {
   }
 
  private:
+  webrtc_factory& factory;
   std::map<decltype(server)::connection_ptr, peer_ptr> connections{};
 
-  std::mutex track_lock;
-  rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver;
+  std::mutex track_lock{};
+  rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver{};
 };
 
 class source_server : public socket_server<source_server> {
  public:
-  source_server(sink_server& sink)
-      : socket_server<source_server>{}, sink{sink}, connection{}, peer{} {}
+  source_server(webrtc_factory& factory, sink_server& sink)
+      : socket_server{}, sink{sink}, connection{}, factory{factory}, peer{} {}
 
   template <typename... types>
   void on_open(websocketpp::connection_hdl hdl, types&&...) {
@@ -444,7 +449,7 @@ class source_server : public socket_server<source_server> {
 
     connection = new_connection;
     peer = webrtc_observer::make(
-        connection,
+        factory, connection,
         [this](rtc::scoped_refptr<webrtc::RtpTransceiverInterface> track) {
           on_track(track);
         },
@@ -487,6 +492,7 @@ class source_server : public socket_server<source_server> {
  private:
   sink_server& sink;
   decltype(server)::connection_ptr connection;
+  webrtc_factory& factory;
   peer_ptr peer;
 };
 
@@ -507,10 +513,13 @@ class scoped_session {
 int main() {
   using namespace receiver;
 
+  // For reasons I genuinely cannot explain, it is *imperative* that all WebRTC
+  // objects in this process share the same factory and signal thread
+  webrtc_factory factory{};
   try {
     rtc::LogMessage::LogToDebug(rtc::LS_ERROR);
-    sink_server sink{};
-    source_server source{sink};
+    sink_server sink{factory};
+    source_server source{factory, sink};
     scoped_session source_session{source, 9002};
     scoped_session sink_session{sink, 9003};
 

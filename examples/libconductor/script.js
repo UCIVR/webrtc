@@ -1,7 +1,9 @@
 let socket = null;
 
 function openSignallingChannel() {
-    let new_socket = new WebSocket("ws://18.236.77.108:9002");
+    //let ip = "18.236.77.108";
+    let ip = "localhost";
+    let new_socket = new WebSocket(`ws://${ip}:${document.getElementById("port").value}`);
     new_socket.onopen = () => {
         socket = new_socket;
         disable();
@@ -9,7 +11,7 @@ function openSignallingChannel() {
             alert("No signalling socket");
             return;
         }
-    
+
         makeCall();
     };
 
@@ -35,25 +37,38 @@ function callReceiver() {
 }
 
 async function makeCall() {
-    const configuration = {iceServers: [
-        {
-            urls: "turn:54.200.166.206:3478?transport=tcp",
-            username: "user",
-            credential: "root"
-        }
-    ]};
-    
-    const peerConnection = new RTCPeerConnection(configuration);
-    let stream = await navigator.mediaDevices.getDisplayMedia({
-        video: {
-            cursor: "always"
-        },
-        audio: false
-    });
-    
-    stream.getTracks().forEach(track => { peerConnection.addTrack(track); });
-    console.log("Added track");
+    const configuration = {
+        iceServers: [
+            {
+                urls: "turn:54.200.166.206:3478?transport=tcp",
+                username: "user",
+                credential: "root"
+            }
+        ]
+    };
 
+    const peerConnection = new RTCPeerConnection(configuration);
+
+    let stream = null;
+    if (document.getElementById("port").value == "9002") {
+        console.log("Adding stream");
+        stream = await navigator.mediaDevices.getDisplayMedia({
+            video: {
+                cursor: "always"
+            },
+            audio: false
+        });
+
+        stream.getTracks().forEach(track => { peerConnection.addTrack(track); });
+        console.log("Added track");
+    } else {
+        console.log("Adding data channel");
+        peerConnection.addTransceiver("video", { direction: "recvonly" })
+        peerConnection.createDataChannel("dummyChannel");
+    }
+
+    peerConnection.ontrack = event => alert("TRACK");
+    peerConnection.ondatachannel = event => alert("CHANNEL");
     peerConnection.onconnectionstatechange = event => {
         console.log(peerConnection.connectionState);
         if (peerConnection.connectionState == "disconnected") {
@@ -61,7 +76,9 @@ async function makeCall() {
             socket = null;
             enable();
             peerConnection.close();
-            stream.getTracks().forEach(track => { track.stop(); });
+            if (stream != null) {
+                stream.getTracks().forEach(track => { track.stop(); });
+            }
         }
     };
 
@@ -86,11 +103,11 @@ async function makeCall() {
 
     const offer = await peerConnection.createOffer();
     await peerConnection.setLocalDescription(offer);
-    socket.send(JSON.stringify({'offer': offer}));
+    socket.send(JSON.stringify({ 'offer': offer }));
 
     peerConnection.onicecandidate = event => {
         if (event.candidate) {
-            socket.send(JSON.stringify({'new-ice-candidate': event.candidate}));
+            socket.send(JSON.stringify({ 'new-ice-candidate': event.candidate }));
         }
     };
 
