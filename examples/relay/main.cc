@@ -143,14 +143,13 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
  public:
   webrtc_observer(webrtc_factory& factory,
                   server_type::connection_ptr signal_socket,
-                  track_callback on_track,
-                  rtc::scoped_refptr<webrtc::RtpTransceiverInterface> track)
+                  track_callback on_track)
       : factory{factory},
         peer{},
         signal_socket{signal_socket},
         on_track{on_track},
-        senders{} {
-    peer = create_peer(this, track);
+        current_sender{} {
+    peer = create_peer(this);
     signal_socket->set_message_handler(
         [this](websocketpp::connection_hdl hdl,
                server_type::message_ptr message) { on_message(hdl, message); });
@@ -163,12 +162,33 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
     return rtc::make_ref_counted<webrtc_observer>(std::forward<types>(args)...);
   }
 
+  void switch_track(
+      rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
+    if (current_sender) {
+      log(level::info, "removing existing track sender");
+      const auto maybe_removed = peer->RemoveTrackOrError(current_sender);
+      if (!maybe_removed.ok()) {
+        log(level::error, "failed to remove existing track from peer:",
+            maybe_removed.message());
+
+        return;
+      }
+    }
+
+    const auto real_track = transceiver->receiver()->track();
+    const auto sender = peer->AddTrack(real_track, {"mirrored_stream"});
+    if (!sender.ok())
+      log(level::error, "failed to add track:", sender.error().message());
+    else
+      log(level::info, "added track to peer");
+  }
+
  private:
   webrtc_factory& factory;
   rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer;
   server_type::connection_ptr signal_socket;
   track_callback on_track;
-  std::vector<rtc::scoped_refptr<webrtc::RtpSenderInterface>> senders{};
+  rtc::scoped_refptr<webrtc::RtpSenderInterface> current_sender;
 
   void close() {
     peer->Close();
@@ -176,8 +196,7 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
   }
 
   static rtc::scoped_refptr<webrtc::PeerConnectionInterface> create_peer(
-      webrtc_observer* host,
-      rtc::scoped_refptr<webrtc::RtpTransceiverInterface> track) {
+      webrtc_observer* host) {
     webrtc::PeerConnectionInterface::RTCConfiguration config{};
     config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
     webrtc::PeerConnectionInterface::IceServer turner{};
@@ -195,19 +214,7 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
 
     log(level::info, "created PeerConnection\n");
 
-    auto peer = maybe_pc.value();
-    if (track) {
-      const auto real_track = track->receiver()->track();
-      const auto sender = peer->AddTrack(real_track, {"mirrored_stream"});
-      if (!sender.ok()) {
-        log(level::error, "failed to add track:", sender.error().message());
-      } else {
-        log(level::info, "added track to peer");
-        host->senders.emplace_back(sender.value());
-      }
-    }
-
-    return std::move(peer);
+    return maybe_pc.value();
   }
 
   void on_message(websocketpp::connection_hdl hdl,
@@ -289,10 +296,6 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
       rtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) override {
     log(level::info, reinterpret_cast<std::uintptr_t>(this),
         "Added data channel to peer");
-
-    // TODO: remove me
-    webrtc::DataChannelInit channel{};
-    peer->CreateDataChannel("I Am a Teapot", &channel);
   }
 
   void OnIceGatheringChange(
@@ -385,8 +388,12 @@ class sink_server : public socket_server<sink_server> {
     const auto new_connection = server.get_con_from_hdl(hdl);
     const auto maybe = connections.find(new_connection);
     if (maybe == connections.end()) {
-      const auto peer = webrtc_observer::make(
-          factory, new_connection, [](auto&&...) {}, transceiver);
+      const auto peer =
+          webrtc_observer::make(factory, new_connection, [](auto&&...) {});
+
+      if (transceiver)
+        peer->switch_track(transceiver);
+
       connections[new_connection] = peer;
     }
   }
@@ -422,8 +429,8 @@ class sink_server : public socket_server<sink_server> {
     log(level::info, "switching sources");
     this->transceiver = transceiver;
     // TODO: OnNegotiationNeeded?
-    // for (const auto& [conn, peer] : connections)
-    //   peer->add_track(transceiver);
+    for (const auto& [conn, peer] : connections)
+      peer->switch_track(transceiver);
   }
 
  private:
@@ -452,8 +459,7 @@ class source_server : public socket_server<source_server> {
         factory, connection,
         [this](rtc::scoped_refptr<webrtc::RtpTransceiverInterface> track) {
           on_track(track);
-        },
-        nullptr);
+        });
   }
 
   void on_close(websocketpp::connection_hdl hdl) {
