@@ -306,7 +306,6 @@ class webrtc_observer : public webrtc::PeerConnectionObserver {
       return;
     }
 
-    log(level::info, "received:", message->get_payload());
     auto payload = boost::json::parse(message->get_payload()).as_object();
     if (payload.contains("description")) {
       auto offer = payload["description"].as_object();
@@ -436,41 +435,6 @@ class webrtc_observer : public webrtc::PeerConnectionObserver {
                         websocketpp::frame::opcode::text);
   }
 
-  // void OnSuccess(webrtc::SessionDescriptionInterface* desc) override {
-  //   log(level::info, reinterpret_cast<std::uintptr_t>(this),
-  //       "created local session description");
-
-  //   assert(desc == peer->local_description());
-  //   boost::json::object data{};
-  //   data["type"] = webrtc::SdpTypeToString(desc->GetType());
-  //   std::string sdp{};
-  //   if (!desc->ToString(&sdp)) {
-  //     log(level::error, reinterpret_cast<std::uintptr_t>(this),
-  //         "failed to serialize SDP");
-
-  //     return;
-  //   }
-
-  //   data["sdp"] = sdp;
-  //   boost::json::object msg{};
-  //   msg["description"] = data;
-  //   signal_socket->send(boost::json::serialize(msg),
-  //                       websocketpp::frame::opcode::text);
-  // }
-
-  // void OnSuccess() override {
-  //   log(level::info, reinterpret_cast<std::uintptr_t>(this),
-  //       "SetSessionDescription succeeded");
-
-  //   peer->SetLocalDescription(this);
-  // }
-
-  // void OnFailure(webrtc::RTCError error) override {
-  //   log(level::error, reinterpret_cast<std::uintptr_t>(this),
-  //       "SetSessionDescription/CreateSessionDescription failed:",
-  //       error.message());
-  // }
-
   void OnTrack(rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver)
       override {
     on_track(transceiver);
@@ -491,6 +455,7 @@ class sink_server : public socket_server<sink_server> {
 
   template <typename... types>
   void on_open(websocketpp::connection_hdl hdl, types&&...) {
+    log(level::info, "New sink has appeared");
     const auto new_connection = server.get_con_from_hdl(hdl);
     const auto maybe = connections.find(new_connection);
     if (maybe == connections.end()) {

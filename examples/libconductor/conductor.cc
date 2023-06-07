@@ -10,6 +10,7 @@
 
 #include <boost/json.hpp>
 #include <boost/json/src.hpp>
+#include <fstream>
 #include <iostream>
 #include <thread>
 
@@ -18,9 +19,9 @@
 #include "api/jsep.h"
 #include "api/video_codecs/builtin_video_decoder_factory.h"
 #include "api/video_codecs/builtin_video_encoder_factory.h"
+#include "websocketpp/client.hpp"
 #include "websocketpp/config/asio_no_tls.hpp"
 #include "websocketpp/server.hpp"
-#include "websocketpp/client.hpp"
 
 using server_type = websocketpp::server<websocketpp::config::asio>;
 using client_type = websocketpp::client<websocketpp::config::asio>;
@@ -30,153 +31,254 @@ using websocketpp::lib::placeholders::_1;
 using websocketpp::lib::placeholders::_2;
 
 namespace conductor {
-class observer : public webrtc::PeerConnectionObserver,
-                 public webrtc::SetSessionDescriptionObserver,
-                 public webrtc::CreateSessionDescriptionObserver,
-                 public rtc::VideoSinkInterface<webrtc::VideoFrame> {
+using peercon_ptr = rtc::scoped_refptr<webrtc::PeerConnectionInterface>;
+
+enum class level { error, warning, info };
+
+constexpr auto name(level l) {
+  switch (l) {
+    case level::error:
+      return "error";
+
+    case level::warning:
+      return "warning";
+
+    case level::info:
+      return "info";
+  }
+}
+
+template <typename... types>
+void log_to(std::ostream& stream, level severity, types&&... args) {
+  stream << "[libconductor:" << name(severity) << "]";
+  ((stream << ' ' << std::forward<types>(args)), ...);
+  stream << std::endl;
+}
+
+template <typename... types>
+void log(level severity, types&&... args) {
+  std::stringstream stream{};
+  log_to(stream, severity, std::forward<types>(args)...);
+  OutputDebugStringA(stream.str().c_str());
+}
+
+struct webrtc_factory {
+  std::unique_ptr<rtc::Thread> signal_thread;
+  rtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory{};
+
+  webrtc_factory()
+      : signal_thread{rtc::Thread::CreateWithSocketServer()}, factory{} {
+    signal_thread->Start();
+    factory = webrtc::CreatePeerConnectionFactory(
+        nullptr, nullptr, signal_thread.get(), nullptr,
+        webrtc::CreateBuiltinAudioEncoderFactory(),
+        webrtc::CreateBuiltinAudioDecoderFactory(),
+        webrtc::CreateBuiltinVideoEncoderFactory(),
+        webrtc::CreateBuiltinVideoDecoderFactory(), nullptr, nullptr);
+
+    if (!factory)
+      throw std::runtime_error{"Failed to create PeerConnectionFactory"};
+  }
+
+  auto operator->() { return factory.operator->(); }
+};
+
+using track_callback =
+    std::function<void(rtc::scoped_refptr<webrtc::RtpTransceiverInterface>)>;
+
+class local_desc_observer
+    : public webrtc::SetLocalDescriptionObserverInterface {
  public:
   template <typename... types>
-  void log_wrapper(bool is_error, types&&... arguments) {
-    std::wstringstream stream{};
-    ((stream << arguments), ...);
-    logger_impl(client, is_error, stream.str().c_str());
+  static auto make(types&&... args) {
+    return rtc::make_ref_counted<local_desc_observer>(
+        std::forward<types>(args)...);
   }
 
-  template <typename... types>
-  void log(types&&... arguments) {
-    log_wrapper(false, arguments...);
-  }
+  local_desc_observer(peercon_ptr peer, server_type::connection_ptr socket)
+      : peer{peer}, socket{socket} {}
 
-  template <typename... types>
-  void log_error(types&&... arguments) {
-    log_wrapper(true, arguments...);
-  }
+  void OnSetLocalDescriptionComplete(webrtc::RTCError error) override {
+    if (!error.ok()) {
+      log(level::error, reinterpret_cast<std::uintptr_t>(this),
+          "SetLocalDescription failed:", error.message());
 
-  observer(void* client, log_function* logger_impl, on_video* on_video_impl)
-      : observer{} {
-    this->client = client;
-    this->logger_impl = logger_impl;
-    this->on_video_impl = on_video_impl;
-  }
-
-  void start_signal_server() {
-    server_thread = std::thread{[this] {
-      signal_thread = rtc::Thread::CreateWithSocketServer();
-      worker_thread = rtc::Thread::CreateWithSocketServer();
-      signal_thread->Start();
-      worker_thread->Start();
-      const auto pc_factory = webrtc::CreatePeerConnectionFactory(
-          nullptr, worker_thread.get(), signal_thread.get(), nullptr,
-          webrtc::CreateBuiltinAudioEncoderFactory(),
-          webrtc::CreateBuiltinAudioDecoderFactory(),
-          webrtc::CreateBuiltinVideoEncoderFactory(),
-          webrtc::CreateBuiltinVideoDecoderFactory(), nullptr, nullptr);
-
-      if (!pc_factory) {
-        log_error("Failed to create PeerConnectionFactory\n");
-        std::exit(-1);
-      }
-
-      webrtc::PeerConnectionInterface::RTCConfiguration config{};
-      config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
-      webrtc::PeerConnectionInterface::IceServer turner{};
-      turner.uri = "turn:54.200.166.206:3478?transport=tcp";
-      turner.username = "user";
-      turner.password = "root";
-      config.servers.emplace_back(std::move(turner));
-
-      const auto maybe_pc = pc_factory->CreatePeerConnectionOrError(
-          config, webrtc::PeerConnectionDependencies{this});
-
-      if (!maybe_pc.ok()) {
-        log_error(L"Failed to create PeerConnection\n");
-        std::exit(-1);
-      }
-
-      peer_connection = std::move(maybe_pc.value());
-
-      // server.init_asio();
-      // server.set_message_handler(
-      //     websocketpp::lib::bind(&observer::on_message, this, ::_1, ::_2));
-
-      // server.set_open_handler(
-      //     websocketpp::lib::bind(&observer::on_open, this, ::_1));
-
-      // server.listen(9002);
-      // server.start_accept();
-      // log("Starting websocket server");
-      // server.run();
-      // log("Stopping websocket server");
-      
-      socket.init_asio();
-      socket.set_message_handler(websocketpp::lib::bind(&observer::on_message, this, ::_1, ::_2));
-      socket.set_open_handler(websocketpp::lib::bind(&observer::on_open, this, ::_1));
-      
-      websocketpp::lib::error_code ec;
-      const auto c = socket.get_connection("ws://18.236.77.108:9003", ec);
-      socket.connect(c);
-      socket.run();
-    }};
-  }
-
-  ~observer() {
-    //server.stop_listening();
-    if (connection) {
-      connection->close(websocketpp::close::status::normal, "Server exiting");
-      log("Shutting down->");
+      return;
     }
 
-    server_thread.join();
-    if (peer_connection) {
-      signal_thread->BlockingCall([this] { peer_connection->Close(); });
+    log(level::info, reinterpret_cast<std::uintptr_t>(this),
+        "SetLocalDescription succeeded");
+
+    const auto desc = peer->local_description();
+    boost::json::object data{};
+    data["type"] = webrtc::SdpTypeToString(desc->GetType());
+    std::string sdp{};
+    if (!desc->ToString(&sdp)) {
+      log(level::error, reinterpret_cast<std::uintptr_t>(this),
+          "failed to serialize SDP");
+
+      return;
     }
 
-    log("Destructor completed");
+    data["sdp"] = sdp;
+    boost::json::object msg{};
+    msg["description"] = data;
+    socket->send(boost::json::serialize(msg), websocketpp::frame::opcode::text);
   }
 
  private:
-  void* client{};
-  std::unique_ptr<rtc::Thread> signal_thread{};
-  std::unique_ptr<rtc::Thread> worker_thread{};
-  log_function* logger_impl{};
-  on_video* on_video_impl{};
-  std::thread server_thread{};
-  client_type socket{};
-  rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection{};
-  rtc::scoped_refptr<webrtc::VideoTrackInterface> track{};
-  server_type::connection_ptr connection{};
-  std::uint64_t frames{};
-  std::mutex big_lock{};
+  peercon_ptr peer;
+  server_type::connection_ptr socket;
+};
 
-  void on_message(websocketpp::connection_hdl hdl, message_ptr message) {
-    // std::lock_guard guard{big_lock};
+class remote_desc_observer
+    : public webrtc::SetRemoteDescriptionObserverInterface {
+ public:
+  template <typename... types>
+  static auto make(types&&... args) {
+    return rtc::make_ref_counted<remote_desc_observer>(
+        std::forward<types>(args)...);
+  }
 
-    if (hdl.lock() != connection) {
-      log_error("Wrong socket!\n");
+  remote_desc_observer(
+      peercon_ptr peer,
+      rtc::scoped_refptr<webrtc::SetLocalDescriptionObserverInterface> observer,
+      bool is_offer)
+      : peer{peer}, observer{observer}, is_offer{is_offer} {}
+
+  void OnSetRemoteDescriptionComplete(webrtc::RTCError error) override {
+    if (is_offer)
+      peer->SetLocalDescription(observer);
+  }
+
+ private:
+  peercon_ptr peer;
+  rtc::scoped_refptr<webrtc::SetLocalDescriptionObserverInterface> observer;
+  bool is_offer;
+};
+
+class webrtc_observer : public webrtc::PeerConnectionObserver {
+ public:
+  webrtc_observer(webrtc_factory& factory,
+                  server_type::connection_ptr signal_socket,
+                  track_callback on_track)
+      : factory{factory},
+        peer{},
+        signal_socket{signal_socket},
+        on_track{on_track},
+        current_sender{},
+        ignore_offer{},
+        making_offer{} {
+    peer = create_peer(this);
+    signal_socket->set_message_handler(
+        [this](websocketpp::connection_hdl hdl,
+               server_type::message_ptr message) { on_message(hdl, message); });
+  }
+
+  ~webrtc_observer() { close(); }
+
+  template <typename... types>
+  static auto make(types&&... args) {
+    return rtc::make_ref_counted<webrtc_observer>(std::forward<types>(args)...);
+  }
+
+  void switch_track(
+      rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
+    if (current_sender) {
+      log(level::info, "removing existing track sender");
+      const auto maybe_removed = peer->RemoveTrackOrError(current_sender);
+      if (!maybe_removed.ok()) {
+        log(level::error, "failed to remove existing track from peer:",
+            maybe_removed.message());
+
+        return;
+      }
+    }
+
+    const auto real_track = transceiver->receiver()->track();
+    const auto sender = peer->AddTrack(real_track, {"mirrored_stream"});
+    if (!sender.ok())
+      log(level::error, "failed to add track:", sender.error().message());
+    else
+      log(level::info, "added track to peer");
+  }
+
+ private:
+  static constexpr auto polite = true;
+
+  webrtc_factory& factory;
+  rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer;
+  server_type::connection_ptr signal_socket;
+  track_callback on_track;
+  rtc::scoped_refptr<webrtc::RtpSenderInterface> current_sender;
+
+  bool ignore_offer;
+  bool making_offer;
+
+  void close() {
+    peer->Close();
+    log(level::info, reinterpret_cast<std::uintptr_t>(this), "closing peer");
+  }
+
+  static rtc::scoped_refptr<webrtc::PeerConnectionInterface> create_peer(
+      webrtc_observer* host) {
+    webrtc::PeerConnectionInterface::RTCConfiguration config{};
+    config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
+    webrtc::PeerConnectionInterface::IceServer turner{};
+    turner.uri = "turn:54.200.166.206:3478?transport=tcp";
+    turner.username = "user";
+    turner.password = "root";
+    config.servers.emplace_back(std::move(turner));
+
+    const auto maybe_pc = host->factory->CreatePeerConnectionOrError(
+        config, webrtc::PeerConnectionDependencies{host});
+
+    if (!maybe_pc.ok()) {
+      throw std::runtime_error{"failed to create PeerConnection"};
+    }
+
+    log(level::info, "created PeerConnection\n");
+
+    return maybe_pc.value();
+  }
+
+  void on_message(websocketpp::connection_hdl hdl,
+                  server_type::message_ptr message) {
+    // TODO: we really should check that it's the expected hdl here
+    const auto opcode = message->get_opcode();
+    if (opcode != 1) {
+      log(level::warning, reinterpret_cast<std::uintptr_t>(this),
+          "I don't know how to use this frame", opcode);
+
       return;
     }
 
-    if (message->get_opcode() != 1) {
-      log_error("I don't know how to use this frame\n");
-      return;
-    }
-
-    log("Received websocket message");
     auto payload = boost::json::parse(message->get_payload()).as_object();
-    if (payload.contains("offer")) {
-      auto offer = payload["offer"].as_object();
+    if (payload.contains("description")) {
+      auto offer = payload["description"].as_object();
+      auto type = offer["type"].as_string();
 
-      peer_connection->SetRemoteDescription(
-          this, webrtc::CreateSessionDescription(
-                    webrtc::SdpTypeFromString(offer["type"].as_string().c_str())
-                        .value(),
-                    offer["sdp"].as_string().c_str())
-                    .release());
+      const auto offer_collision =
+          type == "offer" &&
+          (making_offer ||
+           peer->signaling_state() != webrtc::PeerConnectionInterface::kStable);
 
-      peer_connection->CreateAnswer(
-          this, webrtc::PeerConnectionInterface::RTCOfferAnswerOptions{});
-    } else if (payload.contains("new-ice-candidate")) {
-      auto blob = payload["new-ice-candidate"].as_object();
+      ignore_offer = !polite && offer_collision;
+      if (ignore_offer)
+        return;
+
+      auto description = webrtc::CreateSessionDescription(
+          webrtc::SdpTypeFromString(type.c_str()).value(),
+          offer["sdp"].as_string().c_str());
+
+      const auto is_offer = type == "offer";
+      peer->SetRemoteDescription(
+          std::move(description),
+          remote_desc_observer::make(
+              peer, local_desc_observer::make(peer, signal_socket), is_offer));
+
+    } else if (payload.contains("candidate")) {
+      auto blob = payload["candidate"].as_object();
       webrtc::SdpParseError error{};
       std::unique_ptr<webrtc::IceCandidateInterface> candidate{
           webrtc::CreateIceCandidate(blob["sdpMid"].as_string().c_str(),
@@ -185,44 +287,70 @@ class observer : public webrtc::PeerConnectionObserver,
                                      &error)};
 
       if (!candidate) {
-        log_error("Failed to parse ICE candidate: ", error.description.c_str(),
-                  "\n");
+        log(level::error, reinterpret_cast<std::uintptr_t>(this),
+            "failed to parse ICE candidate: ", error.description);
         return;
       }
 
-      peer_connection->AddIceCandidate(
+      peer->AddIceCandidate(
           std::move(candidate), [this](webrtc::RTCError error) {
-            if (!error.ok()) {
-              log("Failed to set ICE candidate with error: ", error.message(),
-                  "\n");
-            }
+            if (!error.ok())
+              log(level::error, reinterpret_cast<std::uintptr_t>(this),
+                  "failed to set ICE candidate with error:", error.message());
           });
     }
   }
 
-  void on_open(websocketpp::connection_hdl hdl) {
-    // std::lock_guard guard{big_lock};
-    log("Connection opened\n");
-    if (connection) {
-      connection->close(websocketpp::close::status::going_away,
-                        "Ruh-roh raggy...");
-      log_error("Force-closed connection");
-    }
+  void OnNegotiationNeededEvent(uint32_t id) override {
+    factory.signal_thread->PostTask([this, id] {
+      if (peer->ShouldFireNegotiationNeededEvent(id)) {
+        making_offer = true;
+        peer->SetLocalDescription(
+            local_desc_observer::make(peer, signal_socket));
 
-    connection = socket.get_con_from_hdl(hdl);
+        making_offer = false;
+      }
+    });
   }
 
   void OnSignalingChange(
-      webrtc::PeerConnectionInterface::SignalingState new_state) override {}
+      webrtc::PeerConnectionInterface::SignalingState new_state) override {
+    const auto name = [new_state] {
+      switch (new_state) {
+        case decltype(new_state)::kStable:
+          return "kStable";
+
+        case decltype(new_state)::kHaveLocalOffer:
+          return "kHaveLocalOffer";
+
+        case decltype(new_state)::kHaveLocalPrAnswer:
+          return "kHaveLocalPrAnswer";
+
+        case decltype(new_state)::kHaveRemoteOffer:
+          return "kHaveRemoteOffer";
+
+        case decltype(new_state)::kHaveRemotePrAnswer:
+          return "kHaveRemotePrAnswer";
+
+        case decltype(new_state)::kClosed:
+          return "kClosed";
+      }
+    }();
+
+    log(level::info, reinterpret_cast<std::uintptr_t>(this),
+        "Signaling state change:", name);
+  }
 
   void OnDataChannel(
-      rtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) override {}
+      rtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) override {
+    log(level::info, reinterpret_cast<std::uintptr_t>(this),
+        "Added data channel to peer");
+  }
 
   void OnIceGatheringChange(
       webrtc::PeerConnectionInterface::IceGatheringState state) override {
-    log(
-        "ICE gathering state change: ",
-        [state] {
+    log(level::info, reinterpret_cast<std::uintptr_t>(this),
+        "ICE gathering state change:", [state] {
           switch (state) {
             case decltype(state)::kIceGatheringComplete:
               return "Complete";
@@ -233,48 +361,14 @@ class observer : public webrtc::PeerConnectionObserver,
             case decltype(state)::kIceGatheringNew:
               return "New";
           }
-        }(),
-        "\n");
-  }
-
-  void OnStandardizedIceConnectionChange(
-      webrtc::PeerConnectionInterface::IceConnectionState state) override {
-    log(
-        "ICE connection state change: ",
-        [state] {
-          switch (state) {
-            case decltype(state)::kIceConnectionChecking:
-              return "Checking";
-
-            case decltype(state)::kIceConnectionClosed:
-              return "Closed";
-
-            case decltype(state)::kIceConnectionCompleted:
-              return "Completed";
-
-            case decltype(state)::kIceConnectionConnected:
-              return "Connected";
-
-            case decltype(state)::kIceConnectionDisconnected:
-              return "Disconnected";
-
-            case decltype(state)::kIceConnectionFailed:
-              return "Failed";
-
-            case decltype(state)::kIceConnectionMax:
-              return "Max";
-
-            case decltype(state)::kIceConnectionNew:
-              return "New";
-          }
-        }(),
-        "\n");
+        }());
   }
 
   void OnIceCandidate(const webrtc::IceCandidateInterface* candidate) override {
     std::string blob{};
     if (!candidate->ToString(&blob)) {
-      log_error("Failed to serialize ICE candidate\n");
+      log(level::error, reinterpret_cast<std::uintptr_t>(this),
+          "failed to serialize ICE candidate");
       return;
     }
 
@@ -283,79 +377,95 @@ class observer : public webrtc::PeerConnectionObserver,
     inner_blob["candidate"] = blob;
     inner_blob["sdpMid"] = candidate->sdp_mid();
     inner_blob["sdpMLineIndex"] = candidate->sdp_mline_index();
-    data["iceCandidate"] = inner_blob;
-    socket.send(connection, boost::json::serialize(data),
-                websocketpp::frame::opcode::text);
-  }
-
-  void OnConnectionChange(
-      webrtc::PeerConnectionInterface::PeerConnectionState state) override {
-    log(
-        "Connection state change: ",
-        [state] {
-          switch (state) {
-            case decltype(state)::kNew:
-              return "New";
-
-            case decltype(state)::kFailed:
-              return "Failed";
-
-            case decltype(state)::kDisconnected:
-              return "Disconnected";
-
-            case decltype(state)::kConnecting:
-              return "Connecting";
-
-            case decltype(state)::kConnected:
-              return "Connected";
-
-            case decltype(state)::kClosed:
-              return "Closed";
-          }
-        }(),
-        "\n");
-  }
-
-  void OnSuccess(webrtc::SessionDescriptionInterface* desc) override {
-    // std::lock_guard guard{big_lock};
-    log("Created local session description\n");
-    peer_connection->SetLocalDescription(this, desc);
-    boost::json::object data{};
-    data["type"] = webrtc::SdpTypeToString(desc->GetType());
-    std::string sdp{};
-    if (!desc->ToString(&sdp)) {
-      log_error("Failed to serialize SDP\n");
-      return;
-    }
-
-    data["sdp"] = sdp;
-    boost::json::object msg{};
-    msg["answer"] = data;
-    socket.send(connection, boost::json::serialize(msg),
-                websocketpp::frame::opcode::text);
-  }
-
-  void OnSuccess() override { log_error("Succeeded!\n"); }
-
-  void OnFailure(webrtc::RTCError error) override {
-    log_error("Failed: ", error.message(), "\n");
+    data["candidate"] = inner_blob;
+    signal_socket->send(boost::json::serialize(data),
+                        websocketpp::frame::opcode::text);
   }
 
   void OnTrack(rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver)
       override {
-    // std::lock_guard guard{big_lock};
-    if (track) {
-      log_error("Expected only one track!");
+    on_track(transceiver);
+  }
+};
+
+using peer_ptr =
+    rtc::scoped_refptr<rtc::FinalRefCountedObject<webrtc_observer>>;
+
+class observer : public rtc::VideoSinkInterface<webrtc::VideoFrame> {
+ public:
+  observer(void* client, on_video* on_video_impl)
+      : socket_client{},
+        client{client},
+        on_video_impl{on_video_impl},
+        frames{},
+        peer{},
+        track{},
+        socket_thread{} {
+    this->client = client;
+    this->on_video_impl = on_video_impl;
+  }
+  76
+  void start(const char* url) {
+    socket_client.init_asio();
+    std::error_code ec;
+    const auto connection = socket_client.get_connection(url, ec);
+    if (ec) {
+      log(level::error, "Connection did not succeed:", ec.message());
+      return;
     }
 
-    log("Added track of type: ",
+    signal_socket = connection;
+
+    connection->set_open_handler(
+        [](auto&&...) { log(level::info, "connected"); });
+
+    connection->set_close_handler(
+        [](auto&&...) { log(level::info, "closed"); });
+
+    connection->set_termination_handler(
+        [](auto&&...) { log(level::info, "terminated"); });
+
+    socket_client.connect(connection);
+    peer = webrtc_observer::make(factory, connection,
+                                 [this](auto track) { on_track(track); });
+
+    socket_thread = std::thread{[this] { socket_client.run(); }};
+  }
+
+  ~observer() {
+    signal_socket->close(websocketpp::close::status::going_away,
+                         "client exiting");
+
+    socket_client.stop();
+    socket_thread.join();
+    log(level::info, "Destructor completed");
+  }
+
+ private:
+  client_type socket_client{};
+  client_type::connection_ptr signal_socket{};
+  webrtc_factory factory{};
+  void* client{};
+  on_video* on_video_impl{};
+  std::uint64_t frames{};
+  peer_ptr peer{};
+  rtc::scoped_refptr<webrtc::VideoTrackInterface> track{};
+  std::thread socket_thread{};
+
+  void on_track(
+      rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
+    if (track) {
+      log(level::error, "Expected only one track!");
+    }
+
+    log(level::info, "Added track of type: ",
         cricket::MediaTypeToString(transceiver->media_type()).c_str(), "\n");
     auto maybe_track = transceiver->receiver()->track();
     if (maybe_track->enabled())
-      log("Track is enabled\n");
+      log(level::info, "Track is enabled\n");
 
     if (maybe_track->kind() != track->kVideoKind) {
-      log_error("Not the expected video track!");
+      log(level::error, "Not the expected video track!");
     }
 
     track = static_cast<webrtc::VideoTrackInterface*>(maybe_track.get());
@@ -366,7 +476,7 @@ class observer : public webrtc::PeerConnectionObserver,
     // std::lock_guard guard{big_lock};
     ++frames;
     if (frames % 600 == 0)
-      log("Another 600 frames were received...");
+      log(level::info, "Another 600 frames were received...");
 
     on_video_impl(
         client, frame.width(), frame.height(),
@@ -386,28 +496,23 @@ class observer : public webrtc::PeerConnectionObserver,
         },
         const_cast<void*>(static_cast<const void*>(&frame)));
   }
-
-  observer() = default;
 };
 
-observer_handle::observer_handle(void* client,
-                                 log_function* logger_impl,
-                                 on_video* on_video_impl)
-    : impl{rtc::make_ref_counted<observer>(client, logger_impl, on_video_impl)
-               .release()} {}
+observer_handle::observer_handle(void* client, on_video* on_video_impl)
+    : impl{new observer{client, on_video_impl}} {}
 
 observer_handle::observer_handle(observer_handle&& other) : impl{} {
   using namespace std;
   swap(impl, other.impl);
 }
 
-void observer_handle::start() {
-  impl->start_signal_server();
+void observer_handle::start(const char* url) {
+  impl->start(url);
 }
 
 observer_handle::~observer_handle() {
   if (impl) {
-    static_cast<webrtc::CreateSessionDescriptionObserver*>(impl)->Release();
+    delete impl;
   }
 }
 

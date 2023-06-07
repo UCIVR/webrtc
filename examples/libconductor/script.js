@@ -1,9 +1,7 @@
 let socket = null;
 
 function openSignallingChannel() {
-    //let ip = "18.236.77.108";
-    let ip = "localhost";
-    let new_socket = new WebSocket(`ws://${ip}:${document.getElementById("port").value}`);
+    let new_socket = new WebSocket(`ws://${document.getElementById("domain").value}:9002`);
     new_socket.onopen = () => {
         socket = new_socket;
         disable();
