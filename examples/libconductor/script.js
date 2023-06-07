@@ -100,6 +100,7 @@ async function makeCall() {
                         send({ description: peerConnection.localDescription });
                     }
                 } else if (candidate) {
+                    console.log(candidate);
                     try {
                         await peerConnection.addIceCandidate(candidate);
                     } catch (err) {

@@ -24,6 +24,8 @@
 using server_type = websocketpp::server<websocketpp::config::asio>;
 using message_ptr = server_type::message_ptr;
 
+using peercon_ptr = rtc::scoped_refptr<webrtc::PeerConnectionInterface>;
+
 namespace receiver {
 enum class level { error, warning, info };
 
@@ -134,12 +136,81 @@ class socket_server {
 using track_callback =
     std::function<void(rtc::scoped_refptr<webrtc::RtpTransceiverInterface>)>;
 
+class local_desc_observer
+    : public webrtc::SetLocalDescriptionObserverInterface {
+ public:
+  template <typename... types>
+  static auto make(types&&... args) {
+    return rtc::make_ref_counted<local_desc_observer>(
+        std::forward<types>(args)...);
+  }
+
+  local_desc_observer(peercon_ptr peer, server_type::connection_ptr socket)
+      : peer{peer}, socket{socket} {}
+
+  void OnSetLocalDescriptionComplete(webrtc::RTCError error) override {
+    if (!error.ok()) {
+      log(level::error, reinterpret_cast<std::uintptr_t>(this),
+          "SetLocalDescription failed:", error.message());
+
+      return;
+    }
+
+    log(level::info, reinterpret_cast<std::uintptr_t>(this),
+        "SetLocalDescription succeeded");
+
+    const auto desc = peer->local_description();
+    boost::json::object data{};
+    data["type"] = webrtc::SdpTypeToString(desc->GetType());
+    std::string sdp{};
+    if (!desc->ToString(&sdp)) {
+      log(level::error, reinterpret_cast<std::uintptr_t>(this),
+          "failed to serialize SDP");
+
+      return;
+    }
+
+    data["sdp"] = sdp;
+    boost::json::object msg{};
+    msg["description"] = data;
+    socket->send(boost::json::serialize(msg), websocketpp::frame::opcode::text);
+  }
+
+ private:
+  peercon_ptr peer;
+  server_type::connection_ptr socket;
+};
+
+class remote_desc_observer
+    : public webrtc::SetRemoteDescriptionObserverInterface {
+ public:
+  template <typename... types>
+  static auto make(types&&... args) {
+    return rtc::make_ref_counted<remote_desc_observer>(
+        std::forward<types>(args)...);
+  }
+
+  remote_desc_observer(
+      peercon_ptr peer,
+      rtc::scoped_refptr<webrtc::SetLocalDescriptionObserverInterface> observer,
+      bool is_offer)
+      : peer{peer}, observer{observer}, is_offer{is_offer} {}
+
+  void OnSetRemoteDescriptionComplete(webrtc::RTCError error) override {
+    if (is_offer)
+      peer->SetLocalDescription(observer);
+  }
+
+ private:
+  peercon_ptr peer;
+  rtc::scoped_refptr<webrtc::SetLocalDescriptionObserverInterface> observer;
+  bool is_offer;
+};
+
 // TODO: stop the relayed stream before destruction completes, to avoid a racy
 // segfault
 // TODO: implement renegotiation so the source can be switched out?
-class webrtc_observer : public webrtc::PeerConnectionObserver,
-                        public webrtc::CreateSessionDescriptionObserver,
-                        public webrtc::SetSessionDescriptionObserver {
+class webrtc_observer : public webrtc::PeerConnectionObserver {
  public:
   webrtc_observer(webrtc_factory& factory,
                   server_type::connection_ptr signal_socket,
@@ -148,7 +219,9 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
         peer{},
         signal_socket{signal_socket},
         on_track{on_track},
-        current_sender{} {
+        current_sender{},
+        ignore_offer{},
+        making_offer{} {
     peer = create_peer(this);
     signal_socket->set_message_handler(
         [this](websocketpp::connection_hdl hdl,
@@ -184,11 +257,16 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
   }
 
  private:
+  static constexpr auto polite = false;
+
   webrtc_factory& factory;
   rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer;
   server_type::connection_ptr signal_socket;
   track_callback on_track;
   rtc::scoped_refptr<webrtc::RtpSenderInterface> current_sender;
+
+  bool ignore_offer;
+  bool making_offer;
 
   void close() {
     peer->Close();
@@ -232,15 +310,27 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
     auto payload = boost::json::parse(message->get_payload()).as_object();
     if (payload.contains("description")) {
       auto offer = payload["description"].as_object();
-      peer->SetRemoteDescription(
-          this, webrtc::CreateSessionDescription(
-                    webrtc::SdpTypeFromString(offer["type"].as_string().c_str())
-                        .value(),
-                    offer["sdp"].as_string().c_str())
-                    .release());
+      auto type = offer["type"].as_string();
 
-      peer->CreateAnswer(
-          this, webrtc::PeerConnectionInterface::RTCOfferAnswerOptions{});
+      const auto offer_collision =
+          type == "offer" &&
+          (making_offer ||
+           peer->signaling_state() != webrtc::PeerConnectionInterface::kStable);
+
+      ignore_offer = !polite && offer_collision;
+      if (ignore_offer)
+        return;
+
+      auto description = webrtc::CreateSessionDescription(
+          webrtc::SdpTypeFromString(type.c_str()).value(),
+          offer["sdp"].as_string().c_str());
+
+      const auto is_offer = type == "offer";
+      peer->SetRemoteDescription(
+          std::move(description),
+          remote_desc_observer::make(
+              peer, local_desc_observer::make(peer, signal_socket), is_offer));
+
     } else if (payload.contains("candidate")) {
       auto blob = payload["candidate"].as_object();
       webrtc::SdpParseError error{};
@@ -263,6 +353,18 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
                   "failed to set ICE candidate with error:", error.message());
           });
     }
+  }
+
+  void OnNegotiationNeededEvent(uint32_t id) override {
+    factory.signal_thread->PostTask([this, id] {
+      if (peer->ShouldFireNegotiationNeededEvent(id)) {
+        making_offer = true;
+        peer->SetLocalDescription(
+            local_desc_observer::make(peer, signal_socket));
+
+        making_offer = false;
+      }
+    });
   }
 
   void OnSignalingChange(
@@ -334,40 +436,43 @@ class webrtc_observer : public webrtc::PeerConnectionObserver,
                         websocketpp::frame::opcode::text);
   }
 
-  void OnSuccess(webrtc::SessionDescriptionInterface* desc) override {
-    log(level::info, reinterpret_cast<std::uintptr_t>(this),
-        "created local session description");
-    peer->SetLocalDescription(this, desc);
-    boost::json::object data{};
-    data["type"] = webrtc::SdpTypeToString(desc->GetType());
-    std::string sdp{};
-    if (!desc->ToString(&sdp)) {
-      log(level::error, reinterpret_cast<std::uintptr_t>(this),
-          "failed to serialize SDP");
+  // void OnSuccess(webrtc::SessionDescriptionInterface* desc) override {
+  //   log(level::info, reinterpret_cast<std::uintptr_t>(this),
+  //       "created local session description");
 
-      return;
-    }
+  //   assert(desc == peer->local_description());
+  //   boost::json::object data{};
+  //   data["type"] = webrtc::SdpTypeToString(desc->GetType());
+  //   std::string sdp{};
+  //   if (!desc->ToString(&sdp)) {
+  //     log(level::error, reinterpret_cast<std::uintptr_t>(this),
+  //         "failed to serialize SDP");
 
-    data["sdp"] = sdp;
-    boost::json::object msg{};
-    msg["description"] = data;
-    signal_socket->send(boost::json::serialize(msg),
-                        websocketpp::frame::opcode::text);
-  }
+  //     return;
+  //   }
 
-  void OnSuccess() override {
-    log(level::info, reinterpret_cast<std::uintptr_t>(this),
-        "SetSessionDescription succeeded");
-  }
+  //   data["sdp"] = sdp;
+  //   boost::json::object msg{};
+  //   msg["description"] = data;
+  //   signal_socket->send(boost::json::serialize(msg),
+  //                       websocketpp::frame::opcode::text);
+  // }
 
-  void OnFailure(webrtc::RTCError error) override {
-    log(level::error, reinterpret_cast<std::uintptr_t>(this),
-        "SetSessionDescription/CreateSessionDescription failed:",
-        error.message());
-  }
+  // void OnSuccess() override {
+  //   log(level::info, reinterpret_cast<std::uintptr_t>(this),
+  //       "SetSessionDescription succeeded");
 
-  void OnTrack(
-      rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
+  //   peer->SetLocalDescription(this);
+  // }
+
+  // void OnFailure(webrtc::RTCError error) override {
+  //   log(level::error, reinterpret_cast<std::uintptr_t>(this),
+  //       "SetSessionDescription/CreateSessionDescription failed:",
+  //       error.message());
+  // }
+
+  void OnTrack(rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver)
+      override {
     on_track(transceiver);
   }
 };
