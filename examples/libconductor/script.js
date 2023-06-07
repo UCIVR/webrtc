@@ -125,21 +125,14 @@ async function makeCall() {
         console.log("[ICE Connection] " + peerConnection.iceConnectionState);
     }
 
-    let stream = null;
-    if (document.getElementById("port").value == "9002") {
-        console.log("Adding stream");
-        stream = await navigator.mediaDevices.getDisplayMedia({
-            video: {
-                cursor: "always"
-            },
-            audio: false
-        });
+    console.log("Adding stream");
+    let stream = await navigator.mediaDevices.getDisplayMedia({
+        video: {
+            cursor: "always"
+        },
+        audio: false
+    });
 
-        stream.getTracks().forEach(track => { peerConnection.addTrack(track); });
-        console.log("Added track");
-    } else {
-        console.log("Adding data channel");
-        peerConnection.addTransceiver("video", { direction: "recvonly" })
-        peerConnection.createDataChannel("dummyChannel");
-    }
+    stream.getTracks().forEach(track => { peerConnection.addTrack(track); });
+    console.log("Added track");
 }

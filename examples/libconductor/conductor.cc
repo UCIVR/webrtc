@@ -404,7 +404,7 @@ class observer : public rtc::VideoSinkInterface<webrtc::VideoFrame> {
     this->client = client;
     this->on_video_impl = on_video_impl;
   }
-  76
+
   void start(const char* url) {
     socket_client.init_asio();
     std::error_code ec;
