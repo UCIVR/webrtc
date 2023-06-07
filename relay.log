@@ -1,0 +1,13 @@
+[relay:info] socket opened
+[relay:info] created PeerConnection
+
+[relay:info] 2998395018992 Signaling state change: kHaveRemoteOffer
+[relay:info] track added 2998395581648
+[relay:info] track enabled 2998395581648
+[relay:info] switching sources
+[relay:info] 2998395018992 Signaling state change: kStable
+[relay:info] 2998395501488 SetLocalDescription succeeded
+[relay:info] 2998395018992 ICE gathering state change: Gathering
+[relay:info] 2998395018992 ICE gathering state change: Complete
+[relay:info] 2998395018992 Signaling state change: kClosed
+[relay:info] 2998395018992 closing peer
